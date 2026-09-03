@@ -1,0 +1,9 @@
+# python3 -m pip install -r requirements.txt
+transformers
+torch
+datasets==3.6.0
+evaluate
+peft
+tiktoken
+bitsandbytes
+wandb

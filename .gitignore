@@ -1,0 +1,12 @@
+results/
+results_old/
+results_seedtest/
+results_smoketest/
+wandb/
+logs/
+
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.venv/
+.env
