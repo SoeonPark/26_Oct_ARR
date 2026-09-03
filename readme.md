@@ -1,5 +1,12 @@
 # 2026 October ARR: Cross-lingual Representation Alignment
 
+## Set Conda Environment
+```
+conda create -n octarr python=3.11 -y
+conda activate octarr
+pip install -r requirements.txt
+```
+
 ## 1. 연구 목표
 
 기존 언어 정렬은 동일 의미의 언어 A/B 문장 representation을 직접
