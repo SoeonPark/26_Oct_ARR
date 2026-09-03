@@ -5,6 +5,11 @@
 conda create -n octarr python=3.11 -y
 conda activate octarr
 pip install -r requirements.txt
+
+# If CUDA driver error occurs,
+python -m pip install --force-reinstall \
+  torch==2.5.1 \
+  --index-url https://download.pytorch.org/whl/cu121 
 ```
 
 ## 1. 연구 목표
