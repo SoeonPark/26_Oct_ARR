@@ -96,7 +96,8 @@ class AlignmentDataset(torch.utils.data.Dataset):
                     # Kept as plain text so per-sample validation logs can show
                     # the exact inputs without decoding token ids back.
                     'source_text': source_text,
-                    'target_text': target_text
+                    'target_text': target_text,
+                    'item': item
                 }
             else:
                 idx -= len(dataset)
@@ -124,7 +125,8 @@ class AlignmentDataset(torch.utils.data.Dataset):
             'target_attention_mask': target_attention_mask,
             'lang_pair': [item['lang_pair'] for item in batch],
             'source_text': [item['source_text'] for item in batch],
-            'target_text': [item['target_text'] for item in batch]
+            'target_text': [item['target_text'] for item in batch],
+            'item': [item['item'] for item in batch]
         }
 
 class MassiveDataset(torch.utils.data.Dataset):
@@ -251,6 +253,7 @@ class MassiveDataset(torch.utils.data.Dataset):
                     data_path,
                     locale,
                     split=hf_split,
+                    trust_remote_code=True,
                 )
 
             except Exception as e:
@@ -583,6 +586,8 @@ class MassiveDataset(torch.utils.data.Dataset):
             "lang": lang,
             "utt": utterance,
             "target": target,
+
+            "item": item,
         }
 
     # ------------------------------------------------------------------
@@ -618,6 +623,7 @@ class MassiveDataset(torch.utils.data.Dataset):
             "lang": [x["lang"] for x in batch],
             "utt": [x["utt"] for x in batch],
             "target": [x["target"] for x in batch],
+            "item": [x["item"] for x in batch],
         }
         
 class CombinedDataset(torch.utils.data.Dataset):

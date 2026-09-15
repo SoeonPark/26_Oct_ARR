@@ -2,6 +2,8 @@
 # nohup bash scripts/transfer_only.sh >> logs/transfer_only.log 2>&1 &
 export CUDA_VISIBLE_DEVICES=0
 set -euo pipefail
+# sleep 1h
+# "Qwen/Qwen3.5-2B" contrastive_then_transfer 다시 돌려야됨
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
@@ -13,12 +15,12 @@ training_type=(
 )
 
 model_names=(
+    # "meta-llama/Llama-3.2-1B-Instruct"
+    # "Qwen/Qwen2.5-1.5B-Instruct"
+    # "Qwen/Qwen3.5-2B"
     "Qwen/Qwen2.5-3B-Instruct"
     "meta-llama/Llama-3.2-3B-Instruct"
-    "meta-llama/Llama-3.2-1B-Instruct"
     "Qwen/Qwen3.5-4B"
-    "Qwen/Qwen3.5-2B"
-    "Qwen/Qwen2.5-1.5B-Instruct"
     )
 alignment_num_samples_per_lang=10000
 batch_size=16
@@ -42,13 +44,13 @@ alignment_hidden_state_layer=8
 alignment_hidden_state_position=last_token
 alignment_temperature=0.05
 
-for training_type in "${training_type[@]}"; do
-  if [[ "${training_type}" == "contrastive_then_transfer" ]]; then
-    num_steps=100000
-  elif [[ "${training_type}" == "transfer_only" ]]; then
-    num_steps=50000
-  fi
-  for model_name in "${model_names[@]}"; do
+for model_name in "${model_names[@]}"; do
+  for training_type in "${training_type[@]}"; do
+    if [[ "${training_type}" == "contrastive_then_transfer" ]]; then
+      num_steps=100000
+    elif [[ "${training_type}" == "transfer_only" ]]; then
+      num_steps=50000
+    fi
     model_tag="${model_name##*/}"
     training_lang_tag="$(IFS=-; printf '%s' "${training_lang[*]}")"
     out_lang_tag="$(IFS=-; printf '%s' "${out_inference_lang[*]}")"

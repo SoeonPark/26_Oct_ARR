@@ -275,6 +275,20 @@ class CustomModel(nn.Module):
                     data["target_attention_mask"],
                 )
             )
+            
+            source_last_layer_embeddings = (
+                self.get_alignment_embeddings(
+                    source_out.hidden_states[-1],
+                    data["source_attention_mask"],
+                )
+            )
+            
+            target_last_layer_embeddings = (
+                self.get_alignment_embeddings(
+                    target_out.hidden_states[-1],
+                    data["target_attention_mask"],
+                )
+            )
 
             if return_per_sample:
                 info_nce_loss, per_sample_values = (
@@ -297,6 +311,8 @@ class CustomModel(nn.Module):
                 "loss": info_nce_loss,
                 "source_embeddings": source_embeddings,
                 "target_embeddings": target_embeddings,
+                "source_last_layer_embeddings": source_last_layer_embeddings,
+                "target_last_layer_embeddings": target_last_layer_embeddings,
                 "lang_pair": data.get("lang_pair"),
                 **per_sample_values,
             }
@@ -304,18 +320,32 @@ class CustomModel(nn.Module):
         if forward_type == "downstream" or forward_type == "inference":
 
             data = inputs["downstream"]
+            layer = self.experiment_config.alignment_hidden_state_layer
 
             output = self.basemodel(
                 input_ids=data["input_ids"],
                 attention_mask=data["attention_mask"],
                 labels=data["labels"],
+                output_hidden_states=True,
                 return_dict=True,
             )
 
+            utt_embeddings = self.get_alignment_embeddings(
+                output.hidden_states[layer],
+                data["attention_mask"]
+            )
+            
+            utt_last_layer_embeddings = self.get_alignment_embeddings(
+                output.hidden_states[-1],
+                data["attention_mask"]
+            )
+            
             downstream_output = {
                 "loss": output.loss,
                 "lang": data.get("lang"),
                 "utt": data.get("utt"),
+                "utt_embeddings": utt_embeddings,
+                "utt_last_layer_embeddings": utt_last_layer_embeddings,
                 "target": data.get("target"),
             }
 

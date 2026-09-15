@@ -475,7 +475,7 @@ def main():
         save_strategy="steps",
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
-        save_only_model=False,
+        save_only_model=True, #False,
         save_on_each_node=False,
         seed=args.training_seed,
         data_seed=args.training_seed,

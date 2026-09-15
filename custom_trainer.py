@@ -8,6 +8,7 @@ from safetensors.torch import load_file as load_safetensors
 from transformers import Trainer
 from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.utils import logging
+import pickle
 
 
 logger = logging.get_logger(__name__)
@@ -34,6 +35,7 @@ class AlternativeRoutingTrainer(Trainer):
         # Filled in prediction_step and written out once per evaluation round.
         self.eval_sample_log_limit = eval_sample_log_limit
         self.eval_sample_buffer = {}
+        self.eval_sample_embedding_buffer = {}
 
         # Accumulate objective-specific losses between Trainer log events.
         self._objective_loss_sums = {
@@ -388,18 +390,44 @@ class AlternativeRoutingTrainer(Trainer):
                 continue
 
             if forward_type == "alignment":
+                soruce_last_layer_embedding_key = f"{forward_type}/{language_key}/source_last_layer_embeddings_{self.state.global_step}_{index}"
+                target_last_layer_embedding_key = f"{forward_type}/{language_key}/target_last_layer_embeddings_{self.state.global_step}_{index}"
+                source_embedding_key = f"{forward_type}/{language_key}/source_embeddings_{self.state.global_step}_{index}"
+                target_embedding_key = f"{forward_type}/{language_key}/target_embeddings_{self.state.global_step}_{index}"
+                self.eval_sample_embedding_buffer[soruce_last_layer_embedding_key] = outputs["source_last_layer_embeddings"][index].detach().cpu().numpy()
+                self.eval_sample_embedding_buffer[target_last_layer_embedding_key] = outputs["target_last_layer_embeddings"][index].detach().cpu().numpy()
+                self.eval_sample_embedding_buffer[source_embedding_key] = outputs["source_embeddings"][index].detach().cpu().numpy()
+                self.eval_sample_embedding_buffer[target_embedding_key] = outputs["target_embeddings"][index].detach().cpu().numpy()
+                
                 record = {
+                    "origin_data": batch["item"][index],
                     "source_text": batch["source_text"][index],
                     "target_text": batch["target_text"][index],
                     "loss": per_sample_loss[index],
                     "positive_cosine": positive_cosine[index],
+                    "embedding_keys": {
+                        "source_last_layer_embedding_key": soruce_last_layer_embedding_key,
+                        "target_last_layer_embedding_key": target_last_layer_embedding_key,
+                        "source_embedding_key": source_embedding_key,
+                        "target_embedding_key": target_embedding_key,
+                    }
                 }
             else:
+                utt_last_layer_embedding_key = f"{forward_type}/{language_key}/utt_last_layer_embeddings_{self.state.global_step}_{index}"
+                utt_embedding_key = f"{forward_type}/{language_key}/utt_embeddings_{self.state.global_step}_{index}"
+                self.eval_sample_embedding_buffer[utt_last_layer_embedding_key] = outputs["utt_last_layer_embeddings"][index].detach().cpu().numpy()
+                self.eval_sample_embedding_buffer[utt_embedding_key] = outputs["utt_embeddings"][index].detach().cpu().numpy()
+                
                 record = {
+                    "origin_data": batch["item"][index],
                     "utt": batch["utt"][index],
                     "target": batch["target"][index],
                     "loss": per_sample_loss[index],
                     "num_target_tokens": num_target_tokens[index],
+                    "embedding_keys": {
+                        "utt_last_layer_embedding_key": utt_last_layer_embedding_key,
+                        "utt_embedding_key": utt_embedding_key,
+                    }
                 }
 
             record["global_step"] = self.state.global_step
@@ -446,7 +474,17 @@ class AlternativeRoutingTrainer(Trainer):
                     indent=2,
                     default=str,
                 )
+                
+            #save embeddings
+            embedding_output_path = (
+                Path(self.args.output_dir)
+                / "eval_samples"
+                / f"step-{self.state.global_step}_embeddings.pkl"
+            )
+            with embedding_output_path.open("wb") as embedding_file:
+                pickle.dump(self.eval_sample_embedding_buffer, embedding_file)
 
             logger.info(f"Saved validation samples to {output_path}")
+            logger.info(f"Saved validation embeddings to {embedding_output_path}")
 
         self.eval_sample_buffer = {}
