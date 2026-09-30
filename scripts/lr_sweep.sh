@@ -54,7 +54,7 @@ for learning_rate in "${learning_rates[@]}"; do
     out_lang_tag="$(IFS=-; printf '%s' "${out_inference_lang[*]}")"
     timestamp="$(date +'%Y%m%d_%H%M%S')"
 
-    run_name="${model_tag}__${training_type}__${alignment_hidden_state_position}__${alignment_hidden_state_layer}__lr${learning_rate}__in_${training_anchor_langs}-${training_lang_tag}__out_${out_lang_tag}__seed${training_seed}__${timestamp}"
+    run_name="${model_tag}__infonce__${training_type}__${alignment_hidden_state_position}__${alignment_hidden_state_layer}__lr${learning_rate}__in_${training_anchor_langs}-${training_lang_tag}__out_${out_lang_tag}__seed${training_seed}__${timestamp}"
 
     python3 main.py \
         --model_name "${model_name}" \
@@ -71,6 +71,8 @@ for learning_rate in "${learning_rates[@]}"; do
         --eval_language_scope in \
         --output_root "${output_root}" \
         --training_type "${training_type}" \
+        --alignment_loss infonce \
+        --train_sample_log_interval 0 \
         --training_anchor_langs "${training_anchor_langs}" \
         --training_lang "${training_lang[@]}" \
         --out_inference_lang "${out_inference_lang[@]}" \

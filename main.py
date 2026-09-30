@@ -22,7 +22,7 @@ from transformers import (
     set_seed,
 )
 
-from config import parse_args
+from config import ALIGNMENT_REFERENCES, parse_args, validate_gap_config
 from custom_trainer import AlternativeRoutingTrainer
 from data_utils import AlignmentDataset, CombinedDataset, MassiveDataset
 from models import CustomModel
@@ -50,7 +50,7 @@ def build_run_name(args):
     ]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return (
-        f"{model_tag}__{args.training_type}"
+        f"{model_tag}__{args.training_type}__{args.alignment_loss}"
         f"__in_{'-'.join(in_languages)}"
         f"__out_{'-'.join(args.out_inference_lang)}"
         f"__{timestamp}"
@@ -253,6 +253,7 @@ def configure_wandb(args, model_tag):
         ",".join(
             [
                 args.training_type,
+                f"alignment_loss:{args.alignment_loss}",
                 model_tag,
                 f"in:{in_language_tag}",
                 f"out:{out_language_tag}",
@@ -268,6 +269,7 @@ def configure_wandb(args, model_tag):
 
 def main():
     args = parse_args()
+    validate_gap_config(args)
     args.wandb_run_name = build_run_name(args)
 
     model_folder = path_safe_name(
@@ -293,6 +295,10 @@ def main():
 
     run_metadata_path = output_dir / "run_metadata.json"
     run_metadata = {
+        "schema_version": 1,
+        "gap_reference": ALIGNMENT_REFERENCES[args.alignment_loss],
+        "gap_embedding_space": "unnormalized",
+        "gap_variance_reduction": "population",
         "status": "initializing",
         "created_at": datetime.now().isoformat(),
         "run_name": args.wandb_run_name,
@@ -426,6 +432,18 @@ def main():
             name: len(dataset)
             for name, dataset in eval_datasets.items()
         },
+        "alignment_dataset_metadata": alignment_dataset.dataset_metadata,
+        "downstream_dataset_metadata": massive_dataset.dataset_metadata,
+        "eval_alignment_dataset_metadata": {
+            name: dataset.alignment_dataset.dataset_metadata
+            for name, dataset in eval_datasets.items()
+            if dataset.alignment_dataset is not None
+        },
+        "eval_downstream_dataset_metadata": {
+            name: dataset.downstream_dataset.dataset_metadata
+            for name, dataset in eval_datasets.items()
+            if dataset.downstream_dataset is not None
+        },
         "lora_coverage": adapter_coverage,
         "trainable_parameters": trainable_parameters,
         "total_parameters": total_parameters,
@@ -504,6 +522,7 @@ def main():
         data_collator=combined_dataset.collate_fn,
         processing_class=tokenizer,
         training_type=args.training_type,
+        alignment_batching=args.alignment_batching,
         total_steps=args.num_steps,
         eval_dataset=eval_datasets,
         eval_sample_log_limit=args.eval_sample_log_limit,
@@ -516,6 +535,8 @@ def main():
     print(f"Run name: {args.wandb_run_name}")
     print(f"Output directory: {output_dir}")
     print(f"Training type: {args.training_type}")
+    print(f"Alignment loss: {args.alignment_loss}")
+    print(f"Alignment batching: {args.alignment_batching}")
     print(f"Initial objective: {trainer.objective_for_step()}")
     print(f"Effective global batch size: {derived_metadata['effective_global_batch_size']}")
     print(f"Total optimizer steps: {args.num_steps}")

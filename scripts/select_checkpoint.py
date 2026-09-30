@@ -15,6 +15,11 @@ import json
 from pathlib import Path
 import re
 
+if __package__:
+    from .compare_runs import read_alignment_loss
+else:
+    from compare_runs import read_alignment_loss
+
 
 # eval_massive_in_ko_loss  ->  ("massive", "in", "ko")
 # eval_align_out_de-en_loss -> ("align", "out", "de-en")
@@ -39,8 +44,9 @@ def parse_args():
             "massive_out, align_out) or <task>_all. Defaults to massive_in: "
             "selecting on an out-language group would use fr/de/it "
             "labels or parallel data for model selection and break the "
-            "fully-unseen claim. Use align_in for contrastive_only, which "
-            "never trains on the task."
+            "fully-unseen claim. Use align_in for InfoNCE-only runs or "
+            "final_step for a predetermined final checkpoint, especially "
+            "gap-only runs where minimum variance can also reflect collapse."
         ),
     )
     parser.add_argument(
@@ -109,14 +115,60 @@ def score_for_rule(step_groups, rule):
     return macro(step_groups.get(rule, {}))
 
 
+def completed_final_step(run_dir, state_path, state):
+    """Require the declared budget to be completed before final-step selection."""
+    num_steps = None
+    for path in (
+        state_path.parent / "experiment_config.json",
+        run_dir / "experiment_config.json",
+        run_dir / "run_metadata.json",
+    ):
+        if not path.is_file():
+            continue
+        with path.open(encoding="utf-8") as handle:
+            config = json.load(handle)
+        if path.name == "run_metadata.json":
+            config = config.get("experiment_config", {})
+        if "num_steps" in config:
+            num_steps = config["num_steps"]
+            break
+    if type(num_steps) is not int or num_steps <= 0:
+        raise SystemExit(
+            "final_step requires a positive num_steps in saved experiment_config.json "
+            "or run_metadata.json. Restore the original run configuration to verify "
+            "its predetermined training budget."
+        )
+    actual_step = state.get("global_step")
+    if actual_step != num_steps:
+        raise SystemExit(
+            f"final_step requires the configured {num_steps} steps to be completed; "
+            f"trainer_state.json records {actual_step}. Resume the run to its "
+            "declared budget before selecting its final checkpoint."
+        )
+    return num_steps
+
+
+def root_adapter_matches_step(run_dir, step):
+    config_path = run_dir / "experiment_config.json"
+    if not config_path.is_file():
+        return False
+    with config_path.open(encoding="utf-8") as handle:
+        config = json.load(handle)
+    return config.get("checkpoint_global_step") == step and any(
+        (run_dir / name).is_file()
+        for name in ("adapter_model.safetensors", "adapter_model.bin")
+    )
+
+
 def main():
     args = parse_args()
     run_dir = Path(args.run_dir).expanduser().resolve()
 
     state, state_path = load_trainer_state(run_dir)
+    alignment_loss = read_alignment_loss(run_dir, state_path)
     steps = collect_losses(state.get("log_history", []))
 
-    if not steps:
+    if not steps and args.rule != "final_step":
         raise SystemExit(
             f"No eval_*_loss entries in {state_path}. Was the run trained with "
             "eval_strategy=steps?"
@@ -124,12 +176,22 @@ def main():
 
     print(f"Run   : {run_dir}")
     print(f"State : {state_path}")
-    print(f"Rule  : {args.rule} (lower is better, language macro average)")
+    print(f"Alignment loss: {alignment_loss}")
+    if args.rule == "final_step":
+        print("Rule  : final_step (no validation-based checkpoint selection)")
+    else:
+        print(f"Rule  : {args.rule} (lower is better, language macro average)")
+    if alignment_loss == "gap_consistency" and args.rule.startswith("align_"):
+        print(
+            "Gap variance alone can favor collapsed representations. "
+            "Use a predetermined final_step for gap-only experiments, "
+            "or massive_in when selecting for task transfer."
+        )
 
     # Out-language data is reserved for the final evaluation. Selecting on it
     # leaks fr/de/it supervision into the pipeline through model choice, even
     # though no out-language gradient was ever taken.
-    if args.rule.startswith(("massive_out", "align_out")):
+    if args.rule.startswith(("massive_out", "align_out")) or args.rule.endswith("_all"):
         print(
             "\nWARNING: selecting on an out-language group uses fr/de/it "
             "validation data for model selection. That conflicts with a "
@@ -153,11 +215,14 @@ def main():
             print(f"{step:>8}  " + "  ".join(cells))
         print()
 
-    scored = [
-        (step, score_for_rule(groups, args.rule))
-        for step, groups in steps.items()
-    ]
-    scored = [(step, score) for step, score in scored if score is not None]
+    if args.rule == "final_step":
+        scored = [(completed_final_step(run_dir, state_path, state), None)]
+    else:
+        scored = [
+            (step, score_for_rule(groups, args.rule))
+            for step, groups in steps.items()
+        ]
+        scored = [(step, score) for step, score in scored if score is not None]
 
     if not scored:
         raise SystemExit(
@@ -165,23 +230,33 @@ def main():
             f"{group_names}"
         )
 
-    best_step, best_score = min(scored, key=lambda pair: pair[1])
+    best_step, best_score = (
+        scored[0] if args.rule == "final_step"
+        else min(scored, key=lambda pair: pair[1])
+    )
 
     print(f"Best step  : {best_step}")
-    print(f"Best score : {best_score:.4f}")
+    if best_score is not None:
+        print(f"Best score : {best_score:.4f}")
 
     # A 100k-step method is evaluated twice as often as a 50k one, so taking the
     # minimum over all of its steps gives it more chances to win. Report the
     # count so the comparison can be equalised, or fall back to final-step.
-    print(f"Candidates : {len(scored)} evaluated steps")
+    print(f"Candidates : {len(scored)}")
 
     # A step is only usable if save_steps produced a checkpoint for it. This is
     # why eval_steps should be a multiple of save_steps.
     checkpoint_dir = run_dir / f"checkpoint-{best_step}"
+    if (
+        args.rule == "final_step"
+        and not checkpoint_dir.is_dir()
+        and root_adapter_matches_step(run_dir, best_step)
+    ):
+        checkpoint_dir = run_dir
     if checkpoint_dir.is_dir():
         print(f"Checkpoint : {checkpoint_dir}")
         print(f"\nEvaluate it with:\n"
-              f"  python3 evaluator.py --checkpoint_path {checkpoint_dir} \\\n"
+              f"  python3 evaluate.py --checkpoint_path {checkpoint_dir} \\\n"
               f"    --split test --language_scope both --tasks alignment massive")
     else:
         available = sorted(
@@ -189,11 +264,18 @@ def main():
             for path in run_dir.glob("checkpoint-*")
         )
         print(f"Checkpoint : MISSING ({checkpoint_dir})")
-        print(
-            "\nThe best validation step has no checkpoint. Set eval_steps to a "
-            "multiple of save_steps so every evaluated step is saved.\n"
-            f"Saved steps: {available}"
-        )
+        if args.rule == "final_step":
+            print(
+                "The configured final step has no matching checkpoint. A root "
+                "adapter is usable only when experiment_config.json records "
+                f"checkpoint_global_step={best_step}. Saved steps: {available}"
+            )
+        else:
+            print(
+                "\nThe best validation step has no checkpoint. Set eval_steps to a "
+                "multiple of save_steps so every evaluated step is saved.\n"
+                f"Saved steps: {available}"
+            )
 
 
 if __name__ == "__main__":

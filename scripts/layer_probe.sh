@@ -55,7 +55,7 @@ for alignment_hidden_state_position in "${positions[@]}"; do
     out_lang_tag="$(IFS=-; printf '%s' "${out_inference_lang[*]}")"
     timestamp="$(date +'%Y%m%d_%H%M%S')"
 
-    run_name="probe__${model_tag}__${alignment_hidden_state_position}__${alignment_hidden_state_layer}__in_${training_anchor_langs}-${training_lang_tag}__out_${out_lang_tag}__seed${training_seed}__${timestamp}"
+    run_name="probe__${model_tag}__infonce__${alignment_hidden_state_position}__${alignment_hidden_state_layer}__in_${training_anchor_langs}-${training_lang_tag}__out_${out_lang_tag}__seed${training_seed}__${timestamp}"
 
     python3 main.py \
       --model_name "${model_name}" \
@@ -72,6 +72,8 @@ for alignment_hidden_state_position in "${positions[@]}"; do
       --eval_sample_log_limit 0 \
       --output_root "${output_root}" \
       --training_type "${training_type}" \
+      --alignment_loss infonce \
+      --train_sample_log_interval 0 \
       --training_anchor_langs "${training_anchor_langs}" \
       --training_lang "${training_lang[@]}" \
       --out_inference_lang "${out_inference_lang[@]}" \

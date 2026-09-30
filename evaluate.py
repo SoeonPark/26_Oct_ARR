@@ -2,6 +2,8 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
+import pickle
+from uuid import uuid4
 
 import torch
 from peft import PeftModel
@@ -13,8 +15,16 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
-from data_utils import AlignmentDataset, MassiveDataset
+from alignment_logging import (
+    AlignmentStatistics,
+    alignment_records,
+    append_jsonl,
+    batch_record,
+)
+from config import ALIGNMENT_REFERENCES, PAIR_BATCH_LOSSES, resolve_alignment_loss
+from data_utils import AlignmentDataset, MassiveDataset, make_sample_id
 from models import CustomModel
+from samplers import AlignmentEvalBatchSampler
 
 
 def parse_eval_args():
@@ -81,6 +91,21 @@ def parse_eval_args():
         help="Save extracted representations in addition to retrieval metrics.",
     )
     parser.add_argument(
+        "--save_alignment_sample_metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stream scalar diagnostics for every alignment sample to JSONL.",
+    )
+    parser.add_argument(
+        "--eval_sample_log_limit",
+        type=int,
+        default=64,
+        help=(
+            "Save inputs and embeddings for the first N samples per task and "
+            "language (or language pair). Set 0 to disable sample recording."
+        ),
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default=None,
@@ -94,6 +119,9 @@ def parse_eval_args():
 
 
 def validate_eval_args(args):
+    if args.eval_sample_log_limit < 0:
+        raise ValueError("eval_sample_log_limit must be nonnegative.")
+
     positive_integer_arguments = {
         "alignment_batch_size": args.alignment_batch_size,
         "massive_batch_size": args.massive_batch_size,
@@ -137,6 +165,63 @@ def write_jsonl(path, records):
             output_file.write("\n")
 
 
+class EvalSampleRecorder:
+    """Bounded sample JSON and key-to-vector pickle, as in Trainer logs."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.records = {}
+        self.embeddings = {}
+
+    def select_indices(self, objective, languages):
+        # Count pending samples too: one batch can exceed a group's allowance.
+        counts = {}
+        indices = []
+        for index, language in enumerate(languages):
+            group = f"{objective}/{language}"
+            count = counts.get(group, len(self.records.get(group, [])))
+            if count < self.limit:
+                indices.append(index)
+                counts[group] = count + 1
+        return indices
+
+    def add(self, objective, language, record, embeddings):
+        group = f"{objective}/{language}"
+        records = self.records.setdefault(group, [])
+        if len(records) >= self.limit:
+            return None
+
+        sample_index = len(records)
+        embedding_keys = {}
+        for name, embedding in embeddings.items():
+            key = f"{group}/{name}_{sample_index}"
+            embedding_keys[f"{name.removesuffix('s')}_key"] = key
+            # Own each small array; do not retain a view of a whole batch.
+            self.embeddings[key] = (
+                embedding.detach().float().cpu().numpy().copy()
+            )
+        saved_record = {
+            **record,
+            "sample_id": record.get("sample_id", f"{group}/{sample_index}"),
+            "embedding_keys": embedding_keys,
+        }
+        records.append(saved_record)
+        return saved_record
+
+    def save(self, output_dir):
+        if not self.records:
+            return
+        samples_path = output_dir / "eval_samples.json"
+        embeddings_path = output_dir / "eval_samples_embeddings.pkl"
+        write_json(samples_path, self.records)
+        with embeddings_path.open("wb") as output_file:
+            pickle.dump(self.embeddings, output_file)
+        self.records.clear()
+        self.embeddings.clear()
+        print(f"Saved evaluation samples to {samples_path}")
+        print(f"Saved sample embeddings to {embeddings_path}")
+
+
 def load_experiment_config(checkpoint_path):
     config_path = checkpoint_path / "experiment_config.json"
 
@@ -150,7 +235,9 @@ def load_experiment_config(checkpoint_path):
 
     # config.py also returns argparse.Namespace. Keeping the same object type
     # lets the rest of this project use config.attribute consistently.
-    return argparse.Namespace(**experiment_config)
+    config = argparse.Namespace(**experiment_config)
+    config.alignment_loss = resolve_alignment_loss(config)
+    return config
 
 
 def validate_alignment_layer(model, experiment_config):
@@ -304,17 +391,53 @@ def validate_loaded_alignment_pairs(dataset, experiment_config, scope):
 
 
 @torch.inference_mode()
-def collect_alignment_embeddings(model, dataloader):
+def collect_alignment_embeddings(
+    model,
+    dataloader,
+    sample_recorder=None,
+    diagnostics=None,
+    sample_metrics_path=None,
+    context=None,
+):
     groups = {}
     input_device = get_model_input_device(model)
     number_of_batches = len(dataloader)
+    context = dict(context or {})
+    context.setdefault("session_id", uuid4().hex)
+    context.setdefault("phase", "evaluation")
+    if sample_metrics_path is not None:
+        sample_metrics_path = Path(sample_metrics_path)
+        sample_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        sample_metrics_path.write_text("", encoding="utf-8")
+        batch_metrics_path = sample_metrics_path.with_name("alignment_batches.jsonl")
+        batch_metrics_path.write_text("", encoding="utf-8")
 
     for batch_index, batch in enumerate(dataloader, start=1):
+        sample_indices = (
+            sample_recorder.select_indices("alignment", batch["lang_pair"])
+            if sample_recorder is not None else []
+        )
         model_batch = move_tensors_to_device(batch, input_device)
         outputs = model(
             forward_type="alignment",
             alignment=model_batch,
+            return_per_sample=True,
         )
+        batch_context = {
+            **context,
+            "batch_index": batch_index,
+            "batch_id": f"{context['session_id']}/{context.get('scope', 'unspecified')}/{batch_index}",
+        }
+        if diagnostics is not None:
+            diagnostics.update(batch, outputs)
+        if sample_metrics_path is not None:
+            append_jsonl(
+                sample_metrics_path,
+                alignment_records(
+                    batch, outputs, range(len(batch["lang_pair"])), batch_context,
+                ),
+            )
+            append_jsonl(batch_metrics_path, [batch_record(batch, outputs, batch_context)])
 
         source_embeddings = outputs["source_embeddings"].float().cpu()
         target_embeddings = outputs["target_embeddings"].float().cpu()
@@ -331,6 +454,29 @@ def collect_alignment_embeddings(model, dataloader):
             )
             groups[language_pair]["target"].append(
                 target_embeddings[item_index]
+            )
+
+        records = alignment_records(batch, outputs, sample_indices, batch_context)
+        for item_index, record in zip(sample_indices, records):
+            sample_recorder.add(
+                "alignment",
+                batch["lang_pair"][item_index],
+                {
+                    **record,
+                    "origin_data": batch["item"][item_index],
+                    "source_text": batch["source_text"][item_index],
+                    "target_text": batch["target_text"][item_index],
+                    "loss": record["per_sample_loss"],
+                    "batch_sample_ids": list(batch["sample_id"]),
+                    "batch_language_pairs": list(batch["lang_pair"]),
+                },
+                {
+                    name: outputs[name][item_index]
+                    for name in (
+                        "source_embeddings", "target_embeddings",
+                        "source_last_layer_embeddings", "target_last_layer_embeddings",
+                    )
+                },
             )
 
         if batch_index == 1 or batch_index % 50 == 0:
@@ -378,6 +524,11 @@ def evaluate_retrieval_direction(
     recall_at_5_count = 0
     reciprocal_rank_sum = 0.0
 
+    candidate_indices = torch.arange(
+        len(candidate_embeddings),
+        device=device,
+    )
+
     for start_index in range(0, number_of_queries, chunk_size):
         end_index = min(
             start_index + chunk_size,
@@ -405,11 +556,24 @@ def evaluate_retrieval_direction(
             correct_candidate_indices,
         ]
 
-        # Rank 1 means that no candidate has a strictly higher cosine score.
-        ranks = (
-            (similarity > correct_scores.unsqueeze(1)).sum(dim=1)
-            + 1
-        )
+        # Sort by descending score, then ascending candidate index.
+        gold_scores = correct_scores.unsqueeze(1)
+
+        # Candidates with a higher score always precede the gold candidate.
+        higher_count = (
+            similarity > gold_scores
+        ).sum(dim=1)
+
+        # Among exact ties, candidates with smaller indices come first.
+        tied_before_count = (
+            (similarity == gold_scores)
+            & (
+                candidate_indices.unsqueeze(0)
+                < correct_candidate_indices.unsqueeze(1)
+            )
+        ).sum(dim=1)
+
+        ranks = 1 + higher_count + tied_before_count
 
         recall_at_1_count += int((ranks <= 1).sum().item())
         recall_at_5_count += int((ranks <= 5).sum().item())
@@ -514,6 +678,7 @@ def evaluate_alignment_retrieval(embedding_groups, chunk_size, device):
     return {
         "candidate_pool": "full language-pair evaluation split",
         "similarity": "cosine",
+        "tie_break": "candidate_index_ascending",
         "pairs": pair_results,
         "language_pair_macro": {
             "recall_at_1": macro_recall_at_1 / number_of_pairs,
@@ -542,9 +707,16 @@ def build_massive_evaluation_samples(dataset):
         for item in language_dataset:
             samples.append(
                 {
+                    "sample_id": make_sample_id(
+                        dataset.config.downstream_task_data,
+                        dataset.lang_map[language],
+                        dataset.SPLIT_MAPPING[dataset.split],
+                        item["id"],
+                    ),
                     "lang": language,
                     "utt": item["utt"],
                     "target": dataset.extract_slots(item["annot_utt"]),
+                    "item": item,
                 }
             )
 
@@ -553,9 +725,11 @@ def build_massive_evaluation_samples(dataset):
 
 def collate_massive_evaluation_samples(batch):
     return {
+        "sample_id": [item["sample_id"] for item in batch],
         "lang": [item["lang"] for item in batch],
         "utt": [item["utt"] for item in batch],
         "target": [item["target"] for item in batch],
+        "item": [item["item"] for item in batch],
     }
 
 
@@ -646,17 +820,85 @@ def calculate_precision_recall_f1(
 
 
 @torch.inference_mode()
+def collect_text_embeddings(model, tokens):
+    """Pool right-padded inputs without retaining generation hidden states."""
+    tokens = move_tensors_to_device(tokens, get_model_input_device(model))
+    outputs = model.basemodel(
+        **tokens,
+        output_hidden_states=True,
+        return_dict=True,
+        use_cache=False,
+    )
+    layer = model.experiment_config.alignment_hidden_state_layer
+    return {
+        name: model.get_alignment_embeddings(
+            outputs.hidden_states[position], tokens["attention_mask"],
+        ).float().cpu().clone()
+        for name, position in (("selected", layer), ("last", -1))
+    }
+
+
+def collect_massive_sample_embeddings(
+    model, tokenizer, utterances, prompt_tokens, sample_indices,
+):
+    # Use the same tokenization/pooling as alignment for utterance-only plots.
+    original_padding_side = tokenizer.padding_side
+    try:
+        tokenizer.padding_side = "right"
+        utterance_tokens = tokenizer(
+            [utterances[index] for index in sample_indices],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=getattr(model.experiment_config, "alignment_max_length", None),
+        )
+    finally:
+        tokenizer.padding_side = original_padding_side
+    utterance_embeddings = collect_text_embeddings(model, utterance_tokens)
+
+    # Generation is left padded. Repack its exact non-pad tokens on the right
+    # for the forward pass: pooling and model positions then match training.
+    prompt_rows = [
+        prompt_tokens["input_ids"][index][
+            prompt_tokens["attention_mask"][index].bool()
+        ]
+        for index in sample_indices
+    ]
+    right_padded_prompts = {
+        "input_ids": torch.nn.utils.rnn.pad_sequence(
+            prompt_rows, batch_first=True, padding_value=tokenizer.pad_token_id,
+        ),
+        "attention_mask": torch.nn.utils.rnn.pad_sequence(
+            [torch.ones_like(row) for row in prompt_rows],
+            batch_first=True, padding_value=0,
+        ),
+    }
+    prompt_embeddings = collect_text_embeddings(model, right_padded_prompts)
+    return {
+        "utt_embeddings": utterance_embeddings["selected"],
+        "utt_last_layer_embeddings": utterance_embeddings["last"],
+        "prompt_embeddings": prompt_embeddings["selected"],
+        "prompt_last_layer_embeddings": prompt_embeddings["last"],
+    }
+
+
+@torch.inference_mode()
 def generate_massive_predictions(
     model,
     tokenizer,
     dataset,
     dataloader,
     max_new_tokens,
+    sample_recorder=None,
+    context=None,
 ):
     predictions = []
     input_device = get_model_input_device(model)
     number_of_batches = len(dataloader)
     original_padding_side = tokenizer.padding_side
+    context = dict(context or {})
+    context.setdefault("session_id", uuid4().hex)
+    context.setdefault("phase", "evaluation")
 
     try:
         # Decoder-only batched generation must be left padded so generation
@@ -664,6 +906,16 @@ def generate_massive_predictions(
         tokenizer.padding_side = "left"
 
         for batch_index, batch in enumerate(dataloader, start=1):
+            batch_id = (
+                f"{context['session_id']}/{context.get('scope', 'unspecified')}"
+                f"/downstream/{batch_index}"
+            )
+            batch_context = {
+                **context,
+                "batch_id": batch_id,
+                "batch_index": batch_index,
+                "actual_batch_size": len(batch["lang"]),
+            }
             prompt_texts = []
 
             for utterance in batch["utt"]:
@@ -708,6 +960,20 @@ def generate_massive_predictions(
                 skip_special_tokens=True,
             )
 
+            sample_indices = (
+                sample_recorder.select_indices("downstream", batch["lang"])
+                if sample_recorder is not None else []
+            )
+            sample_embeddings = (
+                collect_massive_sample_embeddings(
+                    model, tokenizer, batch["utt"], prompt_tokens, sample_indices,
+                )
+                if sample_indices else {}
+            )
+            sample_positions = {
+                index: position for position, index in enumerate(sample_indices)
+            }
+
             for item_index, generated_answer in enumerate(
                 generated_answers
             ):
@@ -717,14 +983,41 @@ def generate_massive_predictions(
 
                 predictions.append(
                     {
+                        **batch_context,
+                        "record_id": f"{batch_id}/sample-{item_index}",
+                        "batch_position": item_index,
+                        "sample_id": batch["sample_id"][item_index],
                         "lang": batch["lang"][item_index],
                         "utt": batch["utt"][item_index],
                         "target": target,
                         "prediction": generated_answer.strip(),
                         "target_slots": target_slots,
                         "predicted_slots": predicted_slots,
+                        "exact_match": sorted(predicted_slots) == sorted(target_slots),
                     }
                 )
+
+                if item_index in sample_positions:
+                    position = sample_positions[item_index]
+                    saved_record = sample_recorder.add(
+                        "downstream",
+                        batch["lang"][item_index],
+                        {
+                            **predictions[-1],
+                            "origin_data": batch["item"][item_index],
+                            "prompt_text": prompt_texts[item_index],
+                            "embedding_inputs": {
+                                "utt": "utterance_only",
+                                "prompt": "generation_prompt_without_answer",
+                            },
+                        },
+                        {
+                            name: embeddings[position]
+                            for name, embeddings in sample_embeddings.items()
+                        },
+                    )
+                    predictions[-1]["sample_id"] = saved_record["sample_id"]
+                    predictions[-1]["embedding_keys"] = saved_record["embedding_keys"]
 
             if batch_index == 1 or batch_index % 50 == 0:
                 print(
@@ -850,6 +1143,7 @@ def evaluate_alignment_scope(
     tokenizer,
     scope,
     scope_output_dir,
+    sample_recorder=None,
 ):
     split_name = f"{scope}_{args.split}"
     dataset = AlignmentDataset(
@@ -862,18 +1156,53 @@ def evaluate_alignment_scope(
         experiment_config,
         scope,
     )
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.alignment_batch_size,
-        shuffle=False,
-        collate_fn=dataset.collate_fn,
+    if resolve_alignment_loss(experiment_config) in PAIR_BATCH_LOSSES:
+        dataloader = DataLoader(
+            dataset,
+            batch_sampler=AlignmentEvalBatchSampler(
+                dataset.pair_ranges, args.alignment_batch_size,
+            ),
+            collate_fn=dataset.collate_fn,
+        )
+    else:
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.alignment_batch_size,
+            shuffle=False,
+            collate_fn=dataset.collate_fn,
+        )
+    diagnostics = AlignmentStatistics()
+    context = {
+        "run_id": getattr(experiment_config, "wandb_run_name", None),
+        "session_id": args.evaluation_session_id,
+        "phase": "evaluation",
+        "split": args.split,
+        "scope": scope,
+        "global_step": getattr(experiment_config, "checkpoint_global_step", None),
+        "alignment_hidden_state_layer": experiment_config.alignment_hidden_state_layer,
+        "alignment_hidden_state_position": experiment_config.alignment_hidden_state_position,
+    }
+    embedding_groups = collect_alignment_embeddings(
+        model,
+        dataloader,
+        sample_recorder,
+        diagnostics=diagnostics,
+        sample_metrics_path=(
+            scope_output_dir / "alignment_samples.jsonl"
+            if args.save_alignment_sample_metrics else None
+        ),
+        context=context,
     )
-    embedding_groups = collect_alignment_embeddings(model, dataloader)
     metrics = evaluate_alignment_retrieval(
         embedding_groups,
         chunk_size=args.retrieval_chunk_size,
         device=get_model_input_device(model),
     )
+    metrics["alignment_loss_type"] = resolve_alignment_loss(experiment_config)
+    metrics["schema_version"] = 1
+    metrics["gap_reference"] = ALIGNMENT_REFERENCES[metrics["alignment_loss_type"]]
+    metrics["distance_diagnostics"] = diagnostics.summary(corpus=True)
+    metrics["dataset_metadata"] = dataset.dataset_metadata
 
     metrics_path = scope_output_dir / "alignment_metrics.json"
     write_json(metrics_path, metrics)
@@ -894,6 +1223,7 @@ def evaluate_massive_scope(
     tokenizer,
     scope,
     scope_output_dir,
+    sample_recorder=None,
 ):
     split_name = f"{scope}_{args.split}"
     dataset = MassiveDataset(
@@ -914,8 +1244,21 @@ def evaluate_massive_scope(
         dataset=dataset,
         dataloader=dataloader,
         max_new_tokens=args.max_new_tokens,
+        sample_recorder=sample_recorder,
+        context={
+            "run_id": getattr(experiment_config, "wandb_run_name", None),
+            "session_id": args.evaluation_session_id,
+            "phase": "evaluation",
+            "split": args.split,
+            "scope": scope,
+            "global_step": getattr(experiment_config, "checkpoint_global_step", None),
+            "alignment_hidden_state_layer": experiment_config.alignment_hidden_state_layer,
+            "alignment_hidden_state_position": experiment_config.alignment_hidden_state_position,
+        },
     )
     metrics = evaluate_massive_predictions(predictions)
+    metrics["schema_version"] = 1
+    metrics["dataset_metadata"] = dataset.dataset_metadata
 
     metrics_path = scope_output_dir / "massive_metrics.json"
     predictions_path = scope_output_dir / "massive_predictions.jsonl"
@@ -930,6 +1273,7 @@ def evaluate_massive_scope(
 def main():
     args = parse_eval_args()
     validate_eval_args(args)
+    args.evaluation_session_id = uuid4().hex
     checkpoint_path = Path(args.checkpoint_path).expanduser().resolve()
 
     if not checkpoint_path.is_dir():
@@ -938,6 +1282,12 @@ def main():
         )
 
     experiment_config = load_experiment_config(checkpoint_path)
+    if (
+        experiment_config.alignment_loss in PAIR_BATCH_LOSSES
+        and "alignment" in args.tasks
+        and args.alignment_batch_size < 2
+    ):
+        raise ValueError("Gap evaluation requires alignment_batch_size >= 2.")
     model, tokenizer = build_model(
         checkpoint_path,
         experiment_config,
@@ -949,6 +1299,10 @@ def main():
     split_output_dir.mkdir(parents=True, exist_ok=True)
 
     evaluation_metadata = {
+        "schema_version": 1,
+        "session_id": args.evaluation_session_id,
+        "gap_reference": ALIGNMENT_REFERENCES[experiment_config.alignment_loss],
+        "gap_embedding_space": "unnormalized",
         "status": "running",
         "started_at": datetime.now().isoformat(),
         "checkpoint_path": str(checkpoint_path),
@@ -960,6 +1314,12 @@ def main():
         "retrieval_chunk_size": args.retrieval_chunk_size,
         "max_new_tokens": args.max_new_tokens,
         "save_alignment_embeddings": args.save_alignment_embeddings,
+        "save_alignment_sample_metrics": args.save_alignment_sample_metrics,
+        "eval_sample_log_limit": args.eval_sample_log_limit,
+        "sample_embedding_inputs": {
+            "alignment": ["source_text", "target_text"],
+            "downstream": ["utterance_only", "generation_prompt_without_answer"],
+        },
         "experiment_config": vars(experiment_config).copy(),
         "results": {},
     }
@@ -978,6 +1338,7 @@ def main():
             scope_output_dir = split_output_dir / scope
             scope_output_dir.mkdir(parents=True, exist_ok=True)
             scope_results = {}
+            sample_recorder = EvalSampleRecorder(args.eval_sample_log_limit)
 
             if "alignment" in args.tasks:
                 scope_results["alignment"] = evaluate_alignment_scope(
@@ -987,6 +1348,7 @@ def main():
                     tokenizer=tokenizer,
                     scope=scope,
                     scope_output_dir=scope_output_dir,
+                    sample_recorder=sample_recorder,
                 )
 
             if "massive" in args.tasks:
@@ -997,8 +1359,10 @@ def main():
                     tokenizer=tokenizer,
                     scope=scope,
                     scope_output_dir=scope_output_dir,
+                    sample_recorder=sample_recorder,
                 )
 
+            sample_recorder.save(scope_output_dir)
             evaluation_metadata["results"][scope] = scope_results
             write_json(metadata_path, evaluation_metadata)
 

@@ -2,6 +2,37 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from config import resolve_alignment_loss
+
+
+def _distance_precision(embeddings):
+    # Upcast before subtraction and norm. Keep float64 for numerical checks.
+    if embeddings.dtype in (torch.float16, torch.bfloat16):
+        return embeddings.float()
+    return embeddings
+
+
+@torch.no_grad()
+def alignment_sample_metrics(source_embeddings, target_embeddings, gap_distances=None):
+    """Detached diagnostics on raw embeddings, shared by all alignment losses."""
+    source = _distance_precision(source_embeddings)
+    target = _distance_precision(target_embeddings)
+    distances = (
+        (target - source).norm(p=2, dim=-1)
+        if gap_distances is None
+        else gap_distances.detach()
+    )
+    positive_cosine = (
+        F.normalize(source, p=2, dim=-1) * F.normalize(target, p=2, dim=-1)
+    ).sum(dim=-1)
+    return {
+        "gap_distance": distances.detach(),
+        "gap_distance_mean": distances.mean().detach(),
+        "source_norm": source.norm(p=2, dim=-1).detach(),
+        "target_norm": target.norm(p=2, dim=-1).detach(),
+        "positive_cosine": positive_cosine.detach(),
+    }
+
 
 class CustomModel(nn.Module):
 
@@ -113,6 +144,8 @@ class CustomModel(nn.Module):
         target_embeddings,
         return_per_sample=False,
     ):
+        raw_source_embeddings = source_embeddings
+        raw_target_embeddings = target_embeddings
         source_embeddings = F.normalize(
             source_embeddings,
             p=2,
@@ -136,6 +169,13 @@ class CustomModel(nn.Module):
             @ target_embeddings.T
         ) / temperature
 
+        return self._infonce_from_logits(
+            logits, raw_source_embeddings, raw_target_embeddings, return_per_sample,
+        )
+
+    def _infonce_from_logits(
+        self, logits, raw_source_embeddings, raw_target_embeddings, return_per_sample=False,
+    ):
         labels = torch.arange(
             logits.size(0),
             device=logits.device,
@@ -167,16 +207,46 @@ class CustomModel(nn.Module):
             + F.cross_entropy(logits.T, labels, reduction="none")
         ) / 2
 
-        # source/target embeddings were reassigned to their normalized form
-        # above, so this dot product is the positive pair's cosine similarity.
-        positive_cosine = (
-            source_embeddings * target_embeddings
-        ).sum(dim=-1)
-
         return loss, {
             "per_sample_loss": per_sample_loss.detach(),
-            "positive_cosine": positive_cosine.detach(),
+            **alignment_sample_metrics(raw_source_embeddings, raw_target_embeddings),
         }
+
+    def compute_contrastive_variant_loss(
+        self, source_embeddings, target_embeddings, language_pairs, return_per_sample=False,
+    ):
+        """Single-pair, microbatch references; diagonal positives and all B candidates."""
+        assert source_embeddings.ndim == 2 and source_embeddings.shape == target_embeddings.shape
+        assert len(source_embeddings) >= 2, "Alignment needs at least two translation pairs."
+        assert language_pairs is not None and len(language_pairs) == len(source_embeddings)
+        assert len(set(language_pairs)) == 1, "Alignment requires a single language pair."
+        config = self.experiment_config
+        loss_type = resolve_alignment_loss(config)
+        # Keep score construction and CE out of AMP; retain float64 for gradcheck.
+        with torch.autocast(device_type=source_embeddings.device.type, enabled=False):
+            source = _distance_precision(source_embeddings)
+            target = _distance_precision(target_embeddings)
+            if loss_type == "centered_infonce":
+                source_centered = source - source.mean(dim=0, keepdim=True)
+                target_centered = target - target.mean(dim=0, keepdim=True)
+                scores = (
+                    F.normalize(source_centered, dim=-1, eps=1e-8)
+                    @ F.normalize(target_centered, dim=-1, eps=1e-8).T
+                )
+            else:
+                gaps = target.unsqueeze(0) - source.unsqueeze(1)
+                if loss_type == "gap_distance_infonce":
+                    distances = gaps.norm(dim=-1)
+                    mean_distance = distances.diagonal().mean()
+                    scale = getattr(config, "alignment_gap_scale", 1.0)
+                    scores = -((distances - mean_distance) / scale).square()
+                elif loss_type == "gap_direction_infonce":
+                    mean_gap = (target - source).mean(dim=0)
+                    scores = F.cosine_similarity(gaps, mean_gap[None, None, :], dim=-1, eps=1e-8)
+                else:
+                    raise ValueError(f"Not a contrastive variant: {loss_type}")
+            logits = scores / getattr(config, "alignment_temperature", 0.05)
+            return self._infonce_from_logits(logits, source, target, return_per_sample)
 
     
     # Our Proposed Gap Consistency Loss
@@ -185,41 +255,44 @@ class CustomModel(nn.Module):
         source_embeddings,
         target_embeddings,
         language_pairs,
+        return_per_sample=False,
     ):
-        gap_vectors = target_embeddings - source_embeddings
+        """Population variance of raw Euclidean translation-pair distances.
 
-        unique_language_pairs = []
-        for language_pair in language_pairs:
-            if language_pair not in unique_language_pairs:
-                unique_language_pairs.append(language_pair)
+        Equal distances incur zero loss regardless of gap direction. The
+        reference distance is this microbatch's mean, not a preserved or fixed
+        language-pair distance.
+        """
+        assert source_embeddings.ndim == target_embeddings.ndim == 2, (
+            "Expected source and target embeddings with shape [batch, hidden]."
+        )
+        assert source_embeddings.shape == target_embeddings.shape, (
+            "Source and target embedding shapes must match."
+        )
+        assert source_embeddings.size(0) >= 2, (
+            "Gap consistency requires at least two translation pairs per microbatch."
+        )
+        assert language_pairs is not None, "Language-pair labels are required."
+        assert len(language_pairs) == source_embeddings.size(0), (
+            "Expected one language-pair label per sample."
+        )
+        unique_language_pairs = set(language_pairs)
+        assert len(unique_language_pairs) == 1, (
+            f"Expected one language pair, got {unique_language_pairs}."
+        )
 
-        pair_losses = []
-
-        for language_pair in unique_language_pairs:
-            pair_mask = torch.tensor(
-                [
-                    current_pair == language_pair
-                    for current_pair in language_pairs
-                ],
-                device=gap_vectors.device,
-                dtype=torch.bool,
-            )
-            pair_gap_vectors = gap_vectors[pair_mask]
-            mean_pair_gap = pair_gap_vectors.mean(
-                dim=0,
-                keepdim=True,
-            )
-            centered_pair_gaps = pair_gap_vectors - mean_pair_gap
-
-            # Mean squared L2 distance from the language-pair mean offset.
-            pair_loss = (
-                centered_pair_gaps.pow(2)
-                .sum(dim=-1)
-                .mean()
-            )
-            pair_losses.append(pair_loss)
-
-        return torch.stack(pair_losses).mean()
+        source = _distance_precision(source_embeddings)
+        target = _distance_precision(target_embeddings)
+        gap_distances = (target - source).norm(p=2, dim=-1)
+        mean_distance = gap_distances.mean()
+        per_sample_loss = (gap_distances - mean_distance).pow(2)
+        loss = per_sample_loss.mean()
+        if not return_per_sample:
+            return loss
+        return loss, {
+            "per_sample_loss": per_sample_loss.detach(),
+            **alignment_sample_metrics(source, target, gap_distances),
+        }
 
     def forward(
         self,
@@ -290,25 +363,35 @@ class CustomModel(nn.Module):
                 )
             )
 
-            if return_per_sample:
-                info_nce_loss, per_sample_values = (
-                    self.compute_alignment_loss(
-                        source_embeddings,
-                        target_embeddings,
-                        return_per_sample=True,
-                    )
+            alignment_loss_type = resolve_alignment_loss(self.experiment_config)
+            if alignment_loss_type == "gap_consistency":
+                loss_result = self.compute_gap_consistency_loss(
+                    source_embeddings,
+                    target_embeddings,
+                    data.get("lang_pair"),
+                    return_per_sample=return_per_sample,
+                )
+            elif alignment_loss_type == "infonce":
+                loss_result = self.compute_alignment_loss(
+                    source_embeddings,
+                    target_embeddings,
+                    return_per_sample=return_per_sample,
                 )
             else:
-                info_nce_loss = (
-                    self.compute_alignment_loss(
-                        source_embeddings,
-                        target_embeddings,
-                    )
+                loss_result = self.compute_contrastive_variant_loss(
+                    source_embeddings,
+                    target_embeddings,
+                    data.get("lang_pair"),
+                    return_per_sample=return_per_sample,
                 )
-                per_sample_values = {}
+            if return_per_sample:
+                alignment_loss, per_sample_values = loss_result
+            else:
+                alignment_loss, per_sample_values = loss_result, {}
 
             alignment_output = {
-                "loss": info_nce_loss,
+                "loss": alignment_loss,
+                "alignment_loss_type": alignment_loss_type,
                 "source_embeddings": source_embeddings,
                 "target_embeddings": target_embeddings,
                 "source_last_layer_embeddings": source_last_layer_embeddings,

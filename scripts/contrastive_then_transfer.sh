@@ -19,6 +19,13 @@ accumulative_steps=1
 logging_steps=1
 save_steps=500
 output_root="./results"
+alignment_loss="${ALIGNMENT_LOSS:-infonce}"
+alignment_batching="${ALIGNMENT_BATCHING:-mixed}"
+if [[ "${alignment_loss}" == gap_consistency ]]; then
+    alignment_batching="${ALIGNMENT_BATCHING:-same_pair}"
+fi
+train_sample_log_interval="${TRAIN_SAMPLE_LOG_INTERVAL:-1000}"
+train_sample_log_limit="${TRAIN_SAMPLE_LOG_LIMIT:-8}"
 
 training_anchor_langs=en
 training_lang=(ko ja es)
@@ -36,7 +43,7 @@ model_tag="${model_name##*/}"
 training_lang_tag="$(IFS=-; printf '%s' "${training_lang[*]}")"
 out_lang_tag="$(IFS=-; printf '%s' "${out_inference_lang[*]}")"
 
-run_name="${model_tag}__${training_type}__${alignment_hidden_state_position}__${alignment_hidden_state_layer}__in_${training_anchor_langs}-${training_lang_tag}__out_${out_lang_tag}__${timestamp}"
+run_name="${model_tag}__${training_type}__${alignment_loss}__${alignment_hidden_state_position}__${alignment_hidden_state_layer}__in_${training_anchor_langs}-${training_lang_tag}__out_${out_lang_tag}__${timestamp}"
 
 exec python3 main.py \
   --model_name "${model_name}" \
@@ -50,6 +57,10 @@ exec python3 main.py \
   --save_steps "${save_steps}" \
   --output_root "${output_root}" \
   --training_type "${training_type}" \
+  --alignment_loss "${alignment_loss}" \
+  --train_sample_log_interval "${train_sample_log_interval}" \
+  --train_sample_log_limit "${train_sample_log_limit}" \
+  --alignment_batching "${alignment_batching}" \
   --training_anchor_langs "${training_anchor_langs}" \
   --training_lang "${training_lang[@]}" \
   --out_inference_lang "${out_inference_lang[@]}" \

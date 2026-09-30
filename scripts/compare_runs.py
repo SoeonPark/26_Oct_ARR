@@ -13,6 +13,10 @@ import argparse
 import json
 from pathlib import Path
 import re
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from config import resolve_alignment_loss
 
 
 METRIC_PATTERN = re.compile(r"^eval_(massive|align)_(in|out)_(.+)_loss$")
@@ -76,6 +80,24 @@ def macro(values):
     return sum(values.values()) / len(values) if values else None
 
 
+def read_alignment_loss(run_dir, state_path):
+    """Read the saved objective; older runs implicitly used InfoNCE."""
+    candidates = [
+        state_path.parent / "experiment_config.json",
+        run_dir / "experiment_config.json",
+        run_dir / "run_metadata.json",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        with path.open(encoding="utf-8") as handle:
+            config = json.load(handle)
+        if path.name == "run_metadata.json":
+            config = config["experiment_config"]
+        return resolve_alignment_loss(config)
+    return "infonce"
+
+
 def main():
     args = parse_args()
     root = Path(args.root).expanduser().resolve()
@@ -91,6 +113,7 @@ def main():
     group_names = set()
 
     for run_dir, state_path in states.items():
+        alignment_loss = read_alignment_loss(run_dir, state_path)
         for step, groups in collect(state_path).items():
             if args.step is not None and step != args.step:
                 continue
@@ -99,7 +122,7 @@ def main():
                 for name, languages in groups.items()
             }
             group_names.update(scores)
-            rows.append((run_dir.name, step, scores))
+            rows.append((run_dir.name, step, alignment_loss, scores))
 
     if not rows:
         at_step = "" if args.step is None else f" at step {args.step}"
@@ -111,22 +134,27 @@ def main():
     name_width = max(len(row[0]) for row in rows)
     name_width = min(name_width, 78)
 
-    header = f"{'run':<{name_width}}  {'step':>7}  " + "  ".join(
+    header = f"{'run':<{name_width}}  {'step':>7}  {'alignment_loss':<15}  " + "  ".join(
         f"{name:>14}" for name in group_names
     )
     print(header)
     print("-" * len(header))
 
-    for name, step, scores in rows:
+    for name, step, alignment_loss, scores in rows:
         cells = []
         for group in group_names:
             value = scores.get(group)
             cells.append("---".rjust(14) if value is None else f"{value:14.4f}")
-        print(f"{name[:name_width]:<{name_width}}  {step:>7}  " + "  ".join(cells))
+        print(
+            f"{name[:name_width]:<{name_width}}  {step:>7}  "
+            f"{alignment_loss:<15}  " + "  ".join(cells)
+        )
 
     print(
-        "\nLower is better. align_* is the InfoNCE loss under the eval batch's "
-        "negatives; chance is ln(eval_batch_size)."
+        "\nalign_* reports the selected alignment loss. Compare values only "
+        "within the same loss type and evaluation batching. InfoNCE uses "
+        "in-batch negatives; gap_consistency is within-batch distance variance. "
+        "A small gap variance alone does not establish semantic alignment."
     )
     print(
         "massive_* on a contrastive_only run is a zero-shot diagnostic, not "

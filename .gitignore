@@ -1,12 +1,56 @@
+# Training/evaluation outputs, including LR sweeps and layer probes
 results/
-results_old/
-results_seedtest/
-results_smoketest/
+results_*/
 wandb/
 logs/
+*.log
+*.log.*
+nohup.out
 
+# Python bytecode, tool caches, and test coverage
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
 .ruff_cache/
+.cache/
+.ipynb_checkpoints/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local virtual environments and environment variables
 .venv/
+venv/
 .env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.template
+
+# Editor and OS temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local notes and report tables; keep the project README and dependencies
+*.[mM][dD]
+!/[rR][eE][aA][dD][mM][eE].[mM][dD]
+*.[tT][xX][tT]
+!/requirements.txt
+*.[cC][sS][vV]
+
+# Generated reports, figures, spreadsheets, and experiment metadata
+/reports/
+*.[jJ][sS][oO][nN]
+*.[jJ][sS][oO][nN][lL]
+*.[jJ][sS][oO][nN]5
+
+# Local scheduling/queue wrappers; retain training/evaluation launchers
+*schedule*.sh
+*queue*.sh
+/scripts/evaluate_gpu*.sh

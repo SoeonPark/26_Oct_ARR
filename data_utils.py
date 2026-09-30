@@ -6,6 +6,15 @@ from transformers import AutoTokenizer
 from datasets import Dataset, load_dataset
 from utils import MASSIVE_LANG_MAP, MASSIVE_SYSTEM_PROMPT
 
+
+def make_sample_id(dataset_name, dataset_config, split, row_id):
+    """Stable identity independent of sampling order, run, or batch position."""
+    return json.dumps(
+        [dataset_name, dataset_config, split, row_id],
+        ensure_ascii=False, separators=(',', ':'),
+    )
+
+
 class AlignmentDataset(torch.utils.data.Dataset):
     def __init__(self, config, tokenizer, split='train', lang_pairs=None):
         self.config = config
@@ -19,6 +28,7 @@ class AlignmentDataset(torch.utils.data.Dataset):
                 
     def load_data(self, data_path):
         self.all_data = dict()
+        self.dataset_metadata = {}
 
         if self.lang_pairs is not None:
             lang_subset = list(self.lang_pairs)
@@ -42,9 +52,21 @@ class AlignmentDataset(torch.utils.data.Dataset):
         for lang_pair in lang_subset:
             try:
                 dataset = load_dataset(data_path, lang_pair, split=SPLIT_MAPPING[self.split])
+                metadata = {
+                    'dataset': data_path,
+                    'config': lang_pair,
+                    'split': SPLIT_MAPPING[self.split],
+                    'fingerprint': getattr(dataset, '_fingerprint', None),
+                    'num_rows': len(dataset),
+                }
+                # Preserve original row identity before shuffle and selection.
+                dataset = dataset.add_column(
+                    '_alignment_row_index', list(range(len(dataset)))
+                )
                 # Shuffle and sample with seed in config
                 dataset = dataset.shuffle(seed=self.config.alignment_sampling_seed).select(range(min(self.config.alignment_num_samples_per_lang, len(dataset))))
                 self.all_data[lang_pair] = dataset
+                self.dataset_metadata[lang_pair] = metadata
                 print(f"Length of {lang_pair} dataset: {len(dataset)}")
                 print(f"Sample data for {lang_pair}: {dataset[0]}")
                 # Sample data for en-ko: {'translation': {'en': "They're shaped like a bus.", 'ko': '할머니처럼 만들었지만.. ? 엉망이지만..'}}
@@ -70,10 +92,25 @@ class AlignmentDataset(torch.utils.data.Dataset):
     def __len__(self):
         return sum(len(dataset) for dataset in self.all_data.values())
 
+    @property
+    def pair_ranges(self):
+        """Global index ranges in the same order used by __getitem__."""
+        ranges = {}
+        offset = 0
+        for pair, dataset in self.all_data.items():
+            ranges[pair] = (offset, offset + len(dataset))
+            offset += len(dataset)
+        return ranges
+
     def __getitem__(self, idx):
         for lang_pair, dataset in self.all_data.items():
             if idx < len(dataset):
-                item = dataset[idx]
+                item = dict(dataset[idx])
+                original_row_index = item.pop('_alignment_row_index')
+                sample_id = make_sample_id(
+                    self.config.alignment_data, lang_pair,
+                    self.dataset_metadata[lang_pair]['split'], original_row_index,
+                )
                 source_lang, target_lang = lang_pair.split('-')
                 source_text = item['translation'][source_lang]
                 target_text = item['translation'][target_lang]
@@ -93,6 +130,8 @@ class AlignmentDataset(torch.utils.data.Dataset):
                     'target_input_ids': target_tokens['input_ids'].squeeze(0),
                     'target_attention_mask': target_tokens['attention_mask'].squeeze(0),
                     'lang_pair': lang_pair,
+                    'sample_id': sample_id,
+                    'original_row_index': original_row_index,
                     # Kept as plain text so per-sample validation logs can show
                     # the exact inputs without decoding token ids back.
                     'source_text': source_text,
@@ -124,6 +163,8 @@ class AlignmentDataset(torch.utils.data.Dataset):
             'target_input_ids': target_input_ids,
             'target_attention_mask': target_attention_mask,
             'lang_pair': [item['lang_pair'] for item in batch],
+            'sample_id': [item['sample_id'] for item in batch],
+            'original_row_index': [item['original_row_index'] for item in batch],
             'source_text': [item['source_text'] for item in batch],
             'target_text': [item['target_text'] for item in batch],
             'item': [item['item'] for item in batch]
@@ -196,6 +237,7 @@ class MassiveDataset(torch.utils.data.Dataset):
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.all_data = {}
+        self.dataset_metadata = {}
         self.cumulative_sizes = []
 
         self.load_data(config.downstream_task_data)
@@ -263,6 +305,13 @@ class MassiveDataset(torch.utils.data.Dataset):
                 ) from e
 
             self.all_data[lang] = dataset
+            self.dataset_metadata[lang] = {
+                "dataset": data_path,
+                "config": locale,
+                "split": hf_split,
+                "fingerprint": getattr(dataset, "_fingerprint", None),
+                "num_rows": len(dataset),
+            }
 
             total_size += len(dataset)
             self.cumulative_sizes.append(total_size)
@@ -584,6 +633,10 @@ class MassiveDataset(torch.utils.data.Dataset):
 
             # Metadata useful for evaluation/debugging.
             "lang": lang,
+            "sample_id": make_sample_id(
+                self.config.downstream_task_data, self.lang_map[lang],
+                self.SPLIT_MAPPING[self.split], item["id"],
+            ),
             "utt": utterance,
             "target": target,
 
@@ -621,6 +674,7 @@ class MassiveDataset(torch.utils.data.Dataset):
             "labels": labels,
 
             "lang": [x["lang"] for x in batch],
+            "sample_id": [x["sample_id"] for x in batch],
             "utt": [x["utt"] for x in batch],
             "target": [x["target"] for x in batch],
             "item": [x["item"] for x in batch],
@@ -633,6 +687,10 @@ class CombinedDataset(torch.utils.data.Dataset):
     Training passes both sub-datasets plus an explicit num_total_data so that
     len(self) == batch x world x accum x num_steps and `max_steps` lands exactly
     at the end of one epoch.
+
+    Integer indices preserve the original mixed-objective sampling. The
+    same_pair batch sampler supplies (alignment_index, downstream_index)
+    tuples with exactly one non-None entry to load only the selected objective.
 
     Validation passes exactly one sub-dataset and leaves num_total_data as None,
     which yields the real dataset length and a single objective per batch.
@@ -668,6 +726,18 @@ class CombinedDataset(torch.utils.data.Dataset):
         return self.num_total_data
 
     def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            alignment_idx, downstream_idx = idx
+            if (alignment_idx is None) == (downstream_idx is None):
+                raise ValueError("Exactly one objective index is required.")
+            if alignment_idx is not None:
+                return {
+                    'alignment': self.alignment_dataset[alignment_idx]
+                }
+            return {
+                'downstream': self.downstream_dataset[downstream_idx]
+            }
+
         item = {}
 
         if self.alignment_dataset is not None:
