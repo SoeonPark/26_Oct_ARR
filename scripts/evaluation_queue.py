@@ -28,7 +28,10 @@ STEP_BUDGETS = {
     "alternative": 100000, "contrastive_then_transfer": 100000,
 }
 TRAINING_SCRIPTS = {
+    # Keep old names too: queues launched before a rename may still be alive.
     "main.py", "scripts/transfer_only.sh", "scripts/contrastive_only.sh",
+    "scripts/massive_transfer_only.sh", "scripts/massive_contrastive_only.sh",
+    "scripts/wmt25_transfer_only.sh", "scripts/wmt25_contrastive_only.sh",
     "scripts/alternative.sh", "scripts/contrastive_then_transfer.sh",
     "scripts/layer_probe.sh", "scripts/lr_sweep.sh",
 }

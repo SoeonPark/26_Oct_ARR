@@ -12,9 +12,44 @@ def shuffled_batches(start, stop, batch_size, seed):
 
     generator = torch.Generator().manual_seed(seed)
     while True:
-        order = torch.randperm(size, generator=generator).tolist()
+        # Full WMT recipes can have hundreds of millions of rows. Retain the
+        # compact permutation tensor and materialize Python integers per batch.
+        order = torch.randperm(size, generator=generator)
         for pos in range(0, size - batch_size + 1, batch_size):
-            yield [start + i for i in order[pos:pos + batch_size]]
+            yield [start + i for i in order[pos:pos + batch_size].tolist()]
+
+
+def cycling_batches(start, stop, batch_size, seed):
+    """Shuffle every row once per cycle, carrying tails into the next cycle."""
+    if stop <= start:
+        raise ValueError("Language pool must not be empty.")
+    generator = torch.Generator().manual_seed(seed)
+    batch = []
+    while True:
+        for index in torch.randperm(stop - start, generator=generator).tolist():
+            batch.append(start + index)
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+
+
+def balanced_mixed_batches(ranges, batch_size, num_examples, seed):
+    """Equal language exposure over the run, with globally shuffled language slots.
+
+    Retain every language's full pool and cycle its own shuffled rows. A batch
+    has no prescribed language composition. Quotas differ by at most one row.
+    """
+    languages = sorted(ranges)
+    generator = torch.Generator().manual_seed(seed)
+    counts = torch.full((len(languages),), num_examples // len(languages), dtype=torch.long)
+    remainder = torch.randperm(len(languages), generator=generator)[:num_examples % len(languages)]
+    counts[remainder] += 1
+    order = torch.repeat_interleave(torch.arange(len(languages)), counts)
+    order = order[torch.randperm(num_examples, generator=generator)]
+    streams = {i: cycling_batches(*ranges[lang], 1, seed + 1 + i)
+               for i, lang in enumerate(languages)}
+    for start in range(0, num_examples, batch_size):
+        yield [next(streams[i])[0] for i in order[start:start + batch_size].tolist()]
 
 
 class PairBatchSampler(Sampler):
@@ -35,6 +70,8 @@ class PairBatchSampler(Sampler):
         accumulation_steps,
         seed,
         objective_at,
+        downstream_ranges=None,
+        downstream_sampling=None,
     ):
         if batch_size < 2 or num_steps <= 0 or accumulation_steps <= 0:
             raise ValueError(
@@ -50,6 +87,10 @@ class PairBatchSampler(Sampler):
         self.accumulation_steps = accumulation_steps
         self.seed = seed
         self.objective_at = objective_at
+        self.downstream_ranges = downstream_ranges
+        self.downstream_sampling = downstream_sampling or ("language_balanced" if downstream_ranges else "proportional")
+        if self.downstream_sampling == "balanced_mixed" and not downstream_ranges:
+            raise ValueError("balanced_mixed requires downstream language ranges.")
         self.drop_last = True
 
     def __len__(self):
@@ -76,6 +117,21 @@ class PairBatchSampler(Sampler):
         )
         alignment_updates = 0
         pair_order = []
+        languages = sorted(self.downstream_ranges or {})
+        language_generator = torch.Generator().manual_seed(self.seed + 100_000)
+        downstream_streams = {
+            lang: cycling_batches(
+                *self.downstream_ranges[lang], self.batch_size, self.seed + 100_001 + i,
+            )
+            for i, lang in enumerate(languages)
+        }
+        downstream_updates, language_order = 0, []
+        if self.downstream_sampling == "balanced_mixed":
+            num_updates = sum(self.objective_at(step) == "downstream" for step in range(self.num_steps))
+            downstream_stream = balanced_mixed_batches(
+                self.downstream_ranges, self.batch_size,
+                num_updates * self.accumulation_steps * self.batch_size, self.seed + 100_000,
+            )
 
         for step in range(self.num_steps):
             objective = self.objective_at(step)
@@ -95,8 +151,17 @@ class PairBatchSampler(Sampler):
                 alignment_updates += 1
 
             elif objective == "downstream":
+                stream = downstream_stream
+                if languages and self.downstream_sampling == "language_balanced":
+                    slot = downstream_updates % len(languages)
+                    if slot == 0:
+                        language_order = torch.randperm(
+                            len(languages), generator=language_generator,
+                        ).tolist()
+                    stream = downstream_streams[languages[language_order[slot]]]
                 for _ in range(self.accumulation_steps):
-                    yield [(None, i) for i in next(downstream_stream)]
+                    yield [(None, i) for i in next(stream)]
+                downstream_updates += 1
 
             else:
                 raise ValueError(f"Unknown objective: {objective}")

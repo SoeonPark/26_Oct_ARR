@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# nohup bash scripts/contrastive_only.sh >> logs/contrastive_only.log 2>&1 &
-# nohup bash scripts/contrastive_only.sh > logs/same_pair_contrastive_only.log 2>&1 &
+# nohup bash scripts/massive_contrastive_only.sh >> logs/contrastive_only.log 2>&1 &
+# nohup bash scripts/massive_contrastive_only.sh > logs/same_pair_contrastive_only.log 2>&1 &
 
-# nohup bash scripts/contrastive_only.sh > logs/0921_Qwen3p5-2B-resumed.log 2>&1 &
-# nohup bash scripts/contrastive_only.sh > logs/0921_Proposed_contrastive.log 2>&1 &
-# nohup bash scripts/contrastive_only.sh >> logs/contrastive_infonce.log 2>&1 &
+# nohup bash scripts/massive_contrastive_only.sh > logs/0921_Qwen3p5-2B-resumed.log 2>&1 &
+# nohup bash scripts/massive_contrastive_only.sh > logs/0921_Proposed_contrastive.log 2>&1 &
+# nohup bash scripts/massive_contrastive_only.sh >> logs/contrastive_infonce.log 2>&1 &
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 # export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -16,18 +16,20 @@ PROJECT_ROOT="$(dirname "${SCRIPT_DIR}")"
 cd "${PROJECT_ROOT}"
 
 training_types=(
-    "contrastive_only"
-    # "alternative"
+    # "contrastive_only"
+    "alternative"
 )
 
 model_names=(
-    # "meta-llama/Llama-3.2-1B-Instruct"
-    "Qwen/Qwen2.5-1.5B-Instruct"
+    "meta-llama/Llama-3.2-1B-Instruct"
     "Qwen/Qwen3.5-2B"
     # "Qwen/Qwen2.5-3B-Instruct"
     # "meta-llama/Llama-3.2-3B-Instruct"
     # "Qwen/Qwen3.5-4B"
     )
+if [[ -n "${MODEL_NAME:-}" ]]; then
+    model_names=("${MODEL_NAME}")
+fi
 alignment_num_samples_per_lang=10000
 batch_size=16
 learning_rate=0.0001
@@ -42,7 +44,7 @@ alignment_losses=(
     # "centered_infonce"
     # "gap_direction_infonce"
 )
-# Set ALIGNMENT_LOSS to run just one loss instead of the default three.
+# Set ALIGNMENT_LOSS to select one loss instead of the active array above.
 if [[ -n "${ALIGNMENT_LOSS:-}" ]]; then
     alignment_losses=("${ALIGNMENT_LOSS}")
 fi
@@ -54,16 +56,23 @@ training_anchor_langs=en
 training_lang=(ko ja es)
 out_inference_lang=(fr de it)
 
-training_seed=42
+training_seeds=(
+    # 42
+    43
+    44
+)
+if [[ -n "${TRAINING_SEED:-}" ]]; then
+    training_seeds=("${TRAINING_SEED}")
+fi
 
-# Must stay identical to transfer_only.sh: the value is written into
-# experiment_config.json and decides which layer evaluate.py extracts
-# representations from, so a mismatch makes the retrieval table incomparable.
-alignment_hidden_state_layer=-1 # 8
+# The selected loss/representation layer is recorded in experiment_config.json.
+# Override explicitly for layer ablations; the standard runs keep the final layer.
+alignment_hidden_state_layer="${ALIGNMENT_HIDDEN_STATE_LAYER:--1}"
 alignment_hidden_state_position=last_token
 alignment_temperature=0.05 # Used by all InfoNCE variants.
 eval_batch_size=16
 eval_steps=2500
+eval_language_scope="${TRAIN_EVAL_LANGUAGE_SCOPE:-in}"
 eval_sample_log_limit=64
 
 project_name="${WANDB_PROJECT:-Oct_ARR}"
@@ -130,8 +139,9 @@ run_experiment() {
     fi
 }
 
-for alignment_loss in "${alignment_losses[@]}"; do
 for model_name in "${model_names[@]}"; do
+for training_seed in "${training_seeds[@]}"; do
+for alignment_loss in "${alignment_losses[@]}"; do
     for training_type in "${training_types[@]}"; do
     # One step is one optimizer update of one objective, so the step budget is
     # not the same as the objective budget. contrastive_only spends every step
@@ -151,6 +161,7 @@ for model_name in "${model_names[@]}"; do
         run_name="${model_tag}__${training_type}__${alignment_loss}__alignmentBatching_${alignment_batching}__${alignment_hidden_state_position}__${alignment_hidden_state_layer}__in_${training_anchor_langs}-${training_lang_tag}__out_${out_lang_tag}__seed${training_seed}__${timestamp}"
 
         run_experiment main.py \
+            --downstream_task massive \
             --model_name "${model_name}" \
             --alignment_num_samples_per_lang "${alignment_num_samples_per_lang}" \
             --batch_size "${batch_size}" \
@@ -174,6 +185,7 @@ for model_name in "${model_names[@]}"; do
             --alignment_temperature "${alignment_temperature}" \
             --eval_batch_size "${eval_batch_size}" \
             --eval_steps "${eval_steps}" \
+            --eval_language_scope "${eval_language_scope}" \
             --eval_sample_log_limit "${eval_sample_log_limit}" \
             --training_seed "${training_seed}" \
             --peft_lora_r 16 \
@@ -188,6 +200,7 @@ for model_name in "${model_names[@]}"; do
             --wandb_mode "${wandb_mode}" \
             || { failed_runs=$((failed_runs + 1)); continue; }
     done
+done
 done
 done
 

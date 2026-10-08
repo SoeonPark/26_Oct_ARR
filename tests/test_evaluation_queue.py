@@ -91,6 +91,10 @@ class EvaluationQueueTests(unittest.TestCase):
             (101, queue.PROJECT_ROOT, ["python", "-u", "main.py"]),
             (102, self.root, ["bash", "scripts/transfer_only.sh"]),
             (103, queue.PROJECT_ROOT, ["python", "evaluate.py"]),
+            (104, queue.PROJECT_ROOT, ["bash", "scripts/massive_transfer_only.sh"]),
+            (105, queue.PROJECT_ROOT, ["bash", "scripts/massive_contrastive_only.sh"]),
+            (106, queue.PROJECT_ROOT, ["bash", "scripts/wmt25_transfer_only.sh"]),
+            (107, queue.PROJECT_ROOT, ["bash", "scripts/wmt25_contrastive_only.sh"]),
         ):
             path = proc / str(pid)
             path.mkdir()
@@ -98,7 +102,8 @@ class EvaluationQueueTests(unittest.TestCase):
             (path / "stat").write_text(f"{pid} (process) " + " ".join(fields))
             (path / "cwd").symlink_to(cwd, target_is_directory=True)
             (path / "cmdline").write_bytes("\0".join(argv).encode() + b"\0")
-        self.assertEqual([p["pid"] for p in queue.training_processes(proc_root=proc)], [100, 101])
+        self.assertEqual(sorted(p["pid"] for p in queue.training_processes(proc_root=proc)),
+                         [100, 101, 104, 105, 106, 107])
 
     def test_idle_wait_requires_no_training_and_no_gpu_processes(self):
         shell = [{"pid": 100, "script": "transfer_only.sh"}]

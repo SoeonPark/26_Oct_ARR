@@ -312,6 +312,9 @@ class CustomModel(nn.Module):
                 ],
                 output_hidden_states=True,
                 return_dict=True,
+                # Alignment uses hidden states only. Avoid allocating [B,T,V]
+                # vocabulary logits, while retaining every token's hidden state.
+                logits_to_keep=1,
             )
 
             target_out = self.basemodel(
@@ -321,6 +324,7 @@ class CustomModel(nn.Module):
                 ],
                 output_hidden_states=True,
                 return_dict=True,
+                logits_to_keep=1,
             )
 
             layer = (
@@ -412,7 +416,6 @@ class CustomModel(nn.Module):
                 output_hidden_states=True,
                 return_dict=True,
             )
-
             utt_embeddings = self.get_alignment_embeddings(
                 output.hidden_states[layer],
                 data["attention_mask"]

@@ -86,6 +86,35 @@ class CheckpointSelectionTests(unittest.TestCase):
             self.assertIn("Alignment loss: infonce", output)
             self.assertIn("Best step  : 100", output)
 
+    def test_wmt_default_uses_seen_validation_and_only_saved_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.make_run(tmp, actual_step=5000, budget=100000, saved_step=None, loss="centered_infonce")
+            (run / "experiment_config.json").write_text(json.dumps({
+                "downstream_task": "wmt23", "training_type": "alternative",
+                "alignment_loss": "centered_infonce", "num_steps": 100000,
+            }))
+            (run / "trainer_state.json").write_text(json.dumps({
+                "global_step": 5000,
+                "log_history": [{"step": step, "eval_wmt23_in_de_loss": loss,
+                                 "eval_align_out_en-zh_loss": 0.01}
+                                for step, loss in [(0, 0.1), (2500, 0.2), (5000, 0.3)]],
+            }))
+            (run / "checkpoint-5000").mkdir()
+            output = io.StringIO()
+            with patch("sys.argv", ["select_checkpoint.py", str(run)]), redirect_stdout(output):
+                main()
+            self.assertIn("Rule  : wmt23_in", output.getvalue())
+            self.assertIn("Best step  : 5000", output.getvalue())
+            self.assertIn("Excluded unsaved validation steps: [0, 2500]", output.getvalue())
+            self.assertIn("--tasks alignment wmt23", output.getvalue())
+
+    def test_task_validation_can_select_matching_final_root_adapter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.make_run(tmp)
+            output = self.select(run, "align_in")
+            self.assertIn(f"Checkpoint : {run}", output)
+            self.assertNotIn("MISSING", output)
+
 
 if __name__ == "__main__":
     unittest.main()

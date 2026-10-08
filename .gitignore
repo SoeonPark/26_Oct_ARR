@@ -1,6 +1,7 @@
 # Training/evaluation outputs, including LR sweeps and layer probes
 results/
 results_*/
+data/
 wandb/
 logs/
 *.log
@@ -22,6 +23,7 @@ coverage.xml
 
 # Local virtual environments and environment variables
 .venv/
+.venv-comet22/
 venv/
 .env
 .env.*
@@ -42,6 +44,7 @@ Thumbs.db
 !/[rR][eE][aA][dD][mM][eE].[mM][dD]
 *.[tT][xX][tT]
 !/requirements.txt
+!/requirements-comet22.txt
 *.[cC][sS][vV]
 
 # Generated reports, figures, spreadsheets, and experiment metadata
@@ -54,3 +57,5 @@ Thumbs.db
 *schedule*.sh
 *queue*.sh
 /scripts/evaluate_gpu*.sh
+/scripts/gpu[0-9]*.sh
+/scripts/tmp.py

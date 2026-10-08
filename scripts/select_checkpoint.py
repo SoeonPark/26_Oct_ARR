@@ -23,8 +23,7 @@ else:
 
 # eval_massive_in_ko_loss  ->  ("massive", "in", "ko")
 # eval_align_out_de-en_loss -> ("align", "out", "de-en")
-METRIC_PATTERN = re.compile(r"^eval_(massive|align)_(in|out)_(.+)_loss$")
-
+METRIC_PATTERN = re.compile(r"^eval_(massive|wmt25|wmt23|align)_(in|out)_(.+)_loss$")
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -38,13 +37,12 @@ def parse_args():
     parser.add_argument(
         "--rule",
         type=str,
-        default="massive_in",
+        default=None,
         help=(
-            "Group to minimise, as <task>_<scope> (massive_in, align_in, "
-            "massive_out, align_out) or <task>_all. Defaults to massive_in: "
-            "selecting on an out-language group would use fr/de/it "
-            "labels or parallel data for model selection and break the "
-            "fully-unseen claim. Use align_in for InfoNCE-only runs or "
+            "Group to minimise, as <task>_<scope> (massive_in, wmt25_in, wmt23_in, "
+            "align_in) or <task>_all. Defaults to the saved downstream task's "
+            "in-language validation, or align_in for contrastive_only. "
+            "Selecting on out-language data breaks the fully-unseen claim. Use "
             "final_step for a predetermined final checkpoint, especially "
             "gap-only runs where minimum variance can also reflect collapse."
         ),
@@ -160,11 +158,26 @@ def root_adapter_matches_step(run_dir, step):
     )
 
 
+def load_run_config(run_dir, state_path):
+    for path in (run_dir / "experiment_config.json",
+                 state_path.parent / "experiment_config.json",
+                 run_dir / "run_metadata.json"):
+        if path.is_file():
+            config = json.loads(path.read_text(encoding="utf-8"))
+            return config.get("experiment_config", {}) if path.name == "run_metadata.json" else config
+    return {}
+
+
 def main():
     args = parse_args()
     run_dir = Path(args.run_dir).expanduser().resolve()
 
     state, state_path = load_trainer_state(run_dir)
+    run_config = load_run_config(run_dir, state_path)
+    downstream_task = run_config.get("downstream_task", "massive")
+    if args.rule is None:
+        args.rule = ("align_in" if run_config.get("training_type") == "contrastive_only"
+                     else f"{downstream_task}_in")
     alignment_loss = read_alignment_loss(run_dir, state_path)
     steps = collect_losses(state.get("log_history", []))
 
@@ -191,11 +204,11 @@ def main():
     # Out-language data is reserved for the final evaluation. Selecting on it
     # leaks fr/de/it supervision into the pipeline through model choice, even
     # though no out-language gradient was ever taken.
-    if args.rule.startswith(("massive_out", "align_out")) or args.rule.endswith("_all"):
+    if args.rule.startswith(("massive_out", "wmt25_out", "wmt23_out", "align_out")) or args.rule.endswith("_all"):
         print(
-            "\nWARNING: selecting on an out-language group uses fr/de/it "
+            "\nWARNING: selecting on an out-language group uses unseen-language "
             "validation data for model selection. That conflicts with a "
-            "fully-unseen transfer claim. Prefer massive_in (task methods) or "
+            f"fully-unseen transfer claim. Prefer {downstream_task}_in (task methods) or "
             "align_in (contrastive_only)."
         )
 
@@ -223,10 +236,18 @@ def main():
             for step, groups in steps.items()
         ]
         scored = [(step, score) for step, score in scored if score is not None]
+        # eval_on_start and different save/eval intervals produce validation
+        # rows without saved adapters. Only a loadable model is a candidate.
+        unavailable = [step for step, _ in scored
+                       if not (run_dir / f"checkpoint-{step}").is_dir()
+                       and not root_adapter_matches_step(run_dir, step)]
+        if unavailable:
+            print(f"Excluded unsaved validation steps: {unavailable}")
+            scored = [(step, score) for step, score in scored if step not in unavailable]
 
     if not scored:
         raise SystemExit(
-            f"Rule '{args.rule}' matched nothing. Available groups: "
+            f"Rule '{args.rule}' has no saved checkpoint with matching validation. Available groups: "
             f"{group_names}"
         )
 
@@ -248,16 +269,19 @@ def main():
     # why eval_steps should be a multiple of save_steps.
     checkpoint_dir = run_dir / f"checkpoint-{best_step}"
     if (
-        args.rule == "final_step"
-        and not checkpoint_dir.is_dir()
+        not checkpoint_dir.is_dir()
         and root_adapter_matches_step(run_dir, best_step)
     ):
         checkpoint_dir = run_dir
     if checkpoint_dir.is_dir():
+        config_path = checkpoint_dir / "experiment_config.json"
+        if config_path.is_file():
+            downstream_task = json.loads(config_path.read_text()).get("downstream_task", "massive")
+        scope = "out" if downstream_task == "wmt25" else "both"
         print(f"Checkpoint : {checkpoint_dir}")
         print(f"\nEvaluate it with:\n"
               f"  python3 evaluate.py --checkpoint_path {checkpoint_dir} \\\n"
-              f"    --split test --language_scope both --tasks alignment massive")
+              f"    --split test --language_scope {scope} --tasks alignment {downstream_task}")
     else:
         available = sorted(
             int(path.name.split("-")[-1])

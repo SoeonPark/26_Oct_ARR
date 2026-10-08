@@ -13,10 +13,10 @@ import torch
 from accelerate import skip_first_batches
 from transformers import TrainingArguments
 
-from config import parse_args
+from config import parse_args, validate_gap_config
 from custom_trainer import AlternativeRoutingTrainer
 from data_utils import AlignmentDataset, CombinedDataset
-from samplers import AlignmentEvalBatchSampler, PairBatchSampler, shuffled_batches
+from samplers import AlignmentEvalBatchSampler, PairBatchSampler, cycling_batches, shuffled_batches
 
 
 class ToyTokenizer:
@@ -79,15 +79,18 @@ def planner(mode, steps):
     return trainer
 
 
-def make_sampler(mode, steps, accumulation=1, pairs=("en-ko", "en-ja", "en-es"), seed=42):
+def make_sampler(mode, steps, accumulation=1, pairs=("en-ko", "en-ja", "en-es"), seed=42,
+                 downstream_ranges=None, downstream_sampling=None):
     return PairBatchSampler(
         pair_ranges=ToyAlignment(pairs).pair_ranges,
-        downstream_size=17,
+        downstream_size=max(stop for _, stop in downstream_ranges.values()) if downstream_ranges else 17,
         batch_size=4,
         num_steps=steps,
         accumulation_steps=accumulation,
         seed=seed,
         objective_at=planner(mode, steps).objective_at,
+        downstream_ranges=downstream_ranges,
+        downstream_sampling=downstream_sampling,
     )
 
 
@@ -101,8 +104,10 @@ class PairBatchingTests(unittest.TestCase):
     def tearDownClass(cls):
         torch.set_num_threads(cls.old_threads)
 
-    def make_trainer(self, tmpdir, mode, accumulation=1, batching="same_pair", workers=0):
+    def make_trainer(self, tmpdir, mode, accumulation=1, batching="same_pair", workers=0, balanced=False):
         dataset = CombinedDataset(ToyAlignment(), ToyDownstream(), 6 * 4 * accumulation)
+        if balanced:
+            dataset.downstream_dataset.language_ranges = {"ko": (0, 3), "ja": (3, 8), "cs": (8, 17)}
         args = TrainingArguments(
             output_dir=tmpdir, use_cpu=True, max_steps=6,
             per_device_train_batch_size=4,
@@ -120,9 +125,35 @@ class PairBatchingTests(unittest.TestCase):
 
     def test_config_defaults_and_option(self):
         with patch("sys.argv", ["main.py"]):
-            self.assertEqual(parse_args().alignment_batching, "mixed")
+            args = parse_args()
+            self.assertEqual(args.alignment_batching, "mixed")
+            self.assertEqual(args.wmt25_corpus_profile, "full_recipe")
+            self.assertEqual(args.wmt25_downstream_sampling, "proportional")
         with patch("sys.argv", ["main.py", "--alignment_batching", "same_pair"]):
             self.assertEqual(parse_args().alignment_batching, "same_pair")
+
+    def test_proportional_downstream_ignores_language_ranges_and_keeps_schedule(self):
+        for mode in ("transfer_only", "contrastive_only", "alternative", "contrastive_then_transfer"):
+            for batching in ("mixed", "same_pair"):
+                with self.subTest(mode=mode, batching=batching), tempfile.TemporaryDirectory() as tmp:
+                    trainer = self.make_trainer(tmp, mode, 3, batching=batching, balanced=True)
+                    trainer.train_dataset.downstream_dataset.downstream_sampling = "proportional"
+                    actual, objectives = [], []
+                    for batch in trainer.get_train_dataloader():
+                        objectives.append(next(iter(batch)))
+                        if "downstream" in batch:
+                            actual.append([(None, row[0] - 1) for row in batch["downstream"]["input_ids"].tolist()])
+                    expected = [batch for batch in make_sampler(mode, 6, 3) if batch[0][1] is not None]
+                    self.assertEqual(actual, expected)
+                    self.assertEqual(objectives, [trainer.objective_at(step) for step in range(6) for _ in range(3)])
+
+    def test_compact_shuffle_preserves_previous_index_sequence(self):
+        generator = torch.Generator().manual_seed(42)
+        expected = []
+        for _ in range(3):
+            order = torch.randperm(17, generator=generator).tolist()
+            expected.extend([[10 + i for i in order[pos:pos + 4]] for pos in range(0, 14, 4)])
+        self.assertEqual(list(islice(shuffled_batches(10, 27, 4, 42), 12)), expected)
 
     def test_eval_batches_preserve_all_examples_and_pair_boundaries(self):
         for batch_size in (2, 3, 16, 32):
@@ -215,6 +246,136 @@ class PairBatchingTests(unittest.TestCase):
         self.assertTrue(all(10 <= i < 20 for b in full_batches for i in b))
         with self.assertRaisesRegex(ValueError, "smaller than batch size"):
             next(shuffled_batches(0, 3, 4, 42))
+
+    def test_balanced_downstream_uses_unequal_pools_and_keeps_streams_across_modes(self):
+        ranges = {"ko": (0, 3), "ja": (3, 14), "cs": (14, 37)}
+        sampler = make_sampler("transfer_only", 12, 3, downstream_ranges=ranges)
+        baseline = list(sampler)
+        self.assertEqual(baseline, list(sampler))
+        counts = Counter()
+        for step in range(12):
+            indices = [idx for batch in baseline[step * 3:(step + 1) * 3] for _, idx in batch]
+            languages = {lang for lang, (start, stop) in ranges.items() for idx in indices if start <= idx < stop}
+            self.assertEqual(len(languages), 1)
+            counts[next(iter(languages))] += 1
+        self.assertEqual(counts, {"ko": 4, "ja": 4, "cs": 4})
+        for mode in ("alternative", "contrastive_then_transfer"):
+            plan = list(make_sampler(mode, 24, 3, downstream_ranges=ranges))
+            self.assertEqual([batch for batch in plan if batch[0][1] is not None], baseline)
+        # Carry the tail; every example is used once before the next shuffle,
+        # including when a pool is smaller than a batch.
+        for size in (3, 11):
+            batches = list(islice(cycling_batches(0, size, 4, 42), size))
+            indices = [i for batch in batches for i in batch]
+            for start in range(0, len(indices), size):
+                self.assertEqual(set(indices[start:start + size]), set(range(size)))
+
+    def test_balanced_trainer_routes_accumulation_and_resume_with_mixed_or_pair_alignment(self):
+        for batching in ("mixed", "same_pair"):
+            with self.subTest(batching=batching), tempfile.TemporaryDirectory() as td:
+                trainer = self.make_trainer(td, "alternative", 3, batching=batching, workers=2, balanced=True)
+                loader = trainer.get_train_dataloader()
+                def signature(batch):
+                    objective = next(iter(batch))
+                    key = "source_input_ids" if objective == "alignment" else "input_ids"
+                    return objective, batch[objective][key].tolist()
+                full = [signature(batch) for batch in loader]
+                self.assertEqual([signature(batch) for batch in skip_first_batches(loader, 15)], full[15:])
+                self.assertEqual([objective for objective, _ in full],
+                                 [trainer.objective_at(step) for step in range(6) for _ in range(3)])
+                counts = Counter()
+                for step in (1, 3, 5):
+                    indices = [row[0] - 1 for _, rows in full[step * 3:(step + 1) * 3] for row in rows]
+                    languages = {lang for lang, (start, stop) in trainer.train_dataset.downstream_dataset.language_ranges.items()
+                                 for index in indices if start <= index < stop}
+                    self.assertEqual(len(languages), 1)
+                    counts[next(iter(languages))] += 1
+                self.assertEqual(counts, {"ko": 1, "ja": 1, "cs": 1})
+                with redirect_stdout(io.StringIO()):
+                    trainer.train()
+                self.assertEqual([objective for objective, _ in trainer.model.seen], [objective for objective, _ in full])
+                self.assertTrue(all(keys == {objective} for objective, keys in trainer.model.seen))
+                self.assertEqual(trainer.objective_update_counts(trainer.state.global_step), (3, 3))
+
+    def test_balanced_mixed_equalizes_examples_without_single_language_batches(self):
+        ranges = {"de": (0, 30), "cs": (30, 41), "ja": (41, 46)}
+        make = lambda mode, steps, seed=42: make_sampler(
+            mode, steps, 2, seed=seed, downstream_ranges=ranges, downstream_sampling="balanced_mixed")
+        baseline = list(make("transfer_only", 50))
+        self.assertEqual(baseline, list(make("transfer_only", 50)))
+        self.assertNotEqual(baseline, list(make("transfer_only", 50, 43)))
+        counts = Counter()
+        seen = set()
+        mixed = 0
+        for batch in baseline:
+            langs = []
+            for _, idx in batch:
+                seen.add(idx)
+                lang = next(k for k, (start, stop) in ranges.items() if start <= idx < stop)
+                langs.append(lang)
+                counts[lang] += 1
+            mixed += len(set(langs)) > 1
+        self.assertEqual(sum(counts.values()), 400)
+        self.assertLessEqual(max(counts.values()) - min(counts.values()), 1)
+        self.assertEqual(seen, set(range(46)))
+        self.assertGreater(mixed, 50)
+        for mode in ("alternative", "contrastive_then_transfer"):
+            self.assertEqual([b for b in make(mode, 100) if b[0][1] is not None], baseline)
+
+    def test_sft_microbatches_preserve_token_mean_gradient_and_alignment_batch(self):
+        from copy import deepcopy
+        from transformers import LlamaConfig, LlamaForCausalLM
+        from models import CustomModel
+        torch.manual_seed(5)
+        base = LlamaForCausalLM(LlamaConfig(vocab_size=32, hidden_size=16, intermediate_size=32,
+                                          num_hidden_layers=1, num_attention_heads=2,
+                                          num_key_value_heads=2, use_cache=False))
+        cfg = SimpleNamespace(downstream_task="wmt23", downstream_micro_batch_size=2,
+                              alignment_hidden_state_layer=-1, alignment_hidden_state_position="last_token",
+                              alignment_loss="centered_infonce", alignment_temperature=0.05,
+                              train_sample_log_interval=0, train_sample_log_limit=0)
+        reference = CustomModel(cfg, deepcopy(base))
+        actual = CustomModel(cfg, deepcopy(base))
+        ids = torch.randint(1, 32, (5, 9));labels = ids.clone()
+        for i, prefix in enumerate([2, 7, 3, 8, 4]):
+            labels[i, :prefix] = -100
+        data = dict(input_ids=ids, attention_mask=torch.ones_like(ids), labels=labels,
+                    lang=['en-de'] * 5, utt=['source'] * 5, target=['target'] * 5)
+        expected = reference(forward_type='downstream', downstream=data)['loss']
+        expected.backward()
+        with tempfile.TemporaryDirectory() as tmp:
+            trainer = AlternativeRoutingTrainer(
+                model=actual, args=TrainingArguments(output_dir=tmp, use_cpu=True, max_steps=2,
+                    per_device_train_batch_size=5, report_to=[], remove_unused_columns=False,
+                    save_strategy='no', eval_strategy='no'), training_type='alternative',
+                alignment_batching='same_pair', total_steps=2, eval_sample_log_limit=0)
+            trainer.current_gradient_accumulation_steps = 1
+            trainer.state.global_step = 1
+            sizes = []
+            hook = actual.basemodel.register_forward_pre_hook(
+                lambda module, args, kwargs: sizes.append(kwargs['input_ids'].size(0)), with_kwargs=True)
+            loss = trainer.training_step(actual, {'downstream': data})
+            self.assertEqual(sizes, [2, 2, 1])
+            torch.testing.assert_close(loss, expected.detach())
+            for (name, left), (_, right) in zip(actual.named_parameters(), reference.named_parameters()):
+                if right.grad is not None:
+                    torch.testing.assert_close(left.grad, right.grad, atol=2e-7, rtol=2e-5, msg=name)
+            actual.zero_grad(set_to_none=True);sizes.clear()
+            trainer.state.global_step = 0
+            trainer.training_step(actual, {'alignment': dict(
+                source_input_ids=ids, source_attention_mask=torch.ones_like(ids),
+                target_input_ids=ids.flip(0), target_attention_mask=torch.ones_like(ids),
+                lang_pair=['de-en'] * 5)})
+            self.assertEqual(sizes, [5, 5])
+            hook.remove()
+
+    def test_wmt_alternation_rejects_odd_total_budget(self):
+        with patch("sys.argv", ["main.py", "--downstream_task", "wmt25", "--training_type", "alternative", "--num_steps", "7"]):
+            args = parse_args()
+        with self.assertRaisesRegex(ValueError, "even num_steps"):
+            validate_gap_config(args)
+        args.num_steps = 8
+        validate_gap_config(args)
 
     def test_actual_trainer_schedule_and_validation(self):
         for mode in ("transfer_only", "contrastive_only", "alternative", "contrastive_then_transfer"):

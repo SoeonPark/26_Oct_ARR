@@ -1,6 +1,18 @@
 import argparse
 
 
+WMT23_ACCESSIBLE_EXCLUSIONS = {
+    "Neulab-tedtalks_train-1-eng-heb": "Official URL returns HTML instead of the corpus archive.",
+    "ELRC-wikipedia_health-1-eng-heb": "Direct ELRC server certificate has expired.",
+}
+
+WMT23_PARTITIONS = {
+    "full_parallel": (("de", "he", "ja"), ("zh", "ru", "uk")),
+    "accessible_parallel": (("de", "he", "ja"), ("zh", "ru", "uk")),
+    "alma_ja_opus": (("de", "cs", "ja"), ("zh", "ru", "uk")),
+}
+
+
 ALIGNMENT_LOSSES = (
     "infonce", "gap_consistency", "gap_distance_infonce",
     "centered_infonce", "gap_direction_infonce",
@@ -29,6 +41,9 @@ def resolve_alignment_loss(config):
 
 def validate_gap_config(args):
     """Validate before loading datasets or model weights."""
+    if (getattr(args, "downstream_task", "massive") in {"wmt23", "wmt25"}
+            and args.training_type == "alternative" and args.num_steps % 2):
+        raise ValueError("WMT alternating training requires even num_steps.")
     loss_type = resolve_alignment_loss(args)
     for name, default in (
         ("train_sample_log_interval", 1000),
@@ -60,6 +75,15 @@ def parse_args():
     # Add arguments here
     parser.add_argument('--alignment_data', type=str, default='Helsinki-NLP/opus-100', help='Path to the dataset.')
     parser.add_argument('--downstream_task_data', type=str, default='AmazonScience/massive', help='Path to the downstream task dataset.')
+    parser.add_argument('--downstream_task', choices=['massive', 'wmt25', 'wmt23'], default='massive', help='Supervised downstream task; alignment remains OPUS-100.')
+    parser.add_argument('--wmt25_data_dir', type=str, default=None, help='Directory produced by scripts/prepare_wmt25.py. Its split seed and corpus profile must match this run.')
+    parser.add_argument('--wmt25_corpus_profile', choices=['full_recipe', 'ted'], default='full_recipe', help='Required prepared-data profile. Reject a TED-only directory when full_recipe is requested.')
+    parser.add_argument('--wmt25_downstream_sampling', choices=['proportional', 'language_balanced'], default='proportional', help='proportional shuffles the combined target-language pool into mixed-language batches; language_balanced selects one target language per optimizer update.')
+    parser.add_argument('--wmt23_data_dir', type=str)
+    parser.add_argument('--wmt23_manifest_sha256', type=str)
+    parser.add_argument('--wmt23_corpus_profile', choices=list(WMT23_PARTITIONS), default='alma_ja_opus', help='alma_ja_opus uses ALMA German/Czech, a documented Japanese human-parallel extension, HF WMT23-Test, and separate OPUS alignment. Legacy recipe profiles remain readable.')
+    parser.add_argument('--wmt23_downstream_sampling', choices=['proportional', 'balanced_mixed'], default='balanced_mixed', help='balanced_mixed equalizes seen-language example exposure over the run while shuffling mixed-language batches and cycling each full pool; proportional preserves historical runs.')
+    parser.add_argument('--downstream_micro_batch_size', type=int, default=0, help='Split SFT only into smaller forwards/backwards within one optimizer update; 0 keeps the full batch. Alignment batch size is unchanged.')
     parser.add_argument('--alignment_num_samples_per_lang', type=int, default=10000, help='Number of samples per language for alignment data.')
     parser.add_argument('--alignment_sampling_seed', type=int, default=42, help='Random seed for sampling alignment data.')
     parser.add_argument('--model_name', type=str, default='meta-llama/Llama-3.2-1B', help='Name of the model to use.')
@@ -101,6 +125,8 @@ def parse_args():
     # Validation
     parser.add_argument('--eval_steps', type=int, default=2500, help='Number of optimizer updates between validations. Should be a multiple of save_steps so that every evaluated step has a checkpoint.')
     parser.add_argument('--eval_batch_size', type=int, default=16, help='Per-device validation batch size. 16 divides the 2000-example OPUS validation splits exactly, which keeps the InfoNCE negative pool constant across batches.')
+    parser.add_argument('--wmt25_eval_batch_size', type=int, default=8, help='WMT25 validation batch size; independent of OPUS/MASSIVE.')
+    parser.add_argument('--wmt25_eval_chunk_size', type=int, default=512, help='Tokens per FP32 CE chunk in WMT25 validation; no sequence truncation.')
     parser.add_argument('--eval_sample_log_limit', type=int, default=64, help='Per-sample validation records saved per language per round. Set 0 to disable.')
     parser.add_argument('--eval_language_scope', type=str, default='both', choices=['in', 'out', 'both'], help="Which language scopes to build validation datasets for. Diagnostic runs that only need in-language signal can halve the validation cost with 'in'. Out-language data must not be used for model selection either way.")
 

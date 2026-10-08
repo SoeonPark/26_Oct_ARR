@@ -1,9 +1,18 @@
 # python3 -m pip install -r requirements.txt
-transformers
-torch
+transformers==5.17.0
+torch==2.14.0
+accelerate==1.15.0
 datasets==3.6.0
-evaluate
-peft
+evaluate==0.4.6
+peft==0.20.0
 tiktoken
-bitsandbytes
-wandb
+bitsandbytes==0.50.2
+wandb==0.30.0
+numpy==2.4.6
+huggingface-hub==1.31.0
+PyYAML
+sacrebleu[ja]==2.6.0
+mtdata==0.4.3
+pyarrow==25.0.1
+# mtdata/pybtex still imports pkg_resources.
+setuptools==80.9.0

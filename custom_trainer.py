@@ -65,6 +65,12 @@ class AlternativeRoutingTrainer(Trainer):
 
         self.model_accepts_loss_kwargs = False
         config = getattr(self.model, "experiment_config", None)
+        self.downstream_micro_batch_size = getattr(config, "downstream_micro_batch_size", 0)
+        self._downstream_loss_weight = None
+        if self.downstream_micro_batch_size < 0:
+            raise ValueError("downstream_micro_batch_size must be nonnegative.")
+        if self.downstream_micro_batch_size and (self.accelerator.num_processes != 1 or self.args.n_gpu > 1):
+            raise ValueError("SFT microbatch accumulation currently requires one process/GPU.")
         self.alignment_loss = resolve_alignment_loss(config)
         self.train_sample_log_interval = getattr(config, "train_sample_log_interval", 1000)
         self.train_sample_log_limit = getattr(config, "train_sample_log_limit", 8)
@@ -116,7 +122,13 @@ class AlternativeRoutingTrainer(Trainer):
         return self.objective_at(self.state.global_step)
 
     def get_train_dataloader(self):
-        if self.alignment_batching == "mixed":
+        dataset = getattr(self, "train_dataset", None)
+        downstream_dataset = getattr(dataset, "downstream_dataset", None)
+        downstream_ranges = getattr(downstream_dataset, "language_ranges", None)
+        downstream_sampling = getattr(downstream_dataset, "downstream_sampling", "language_balanced")
+        if downstream_sampling == "balanced_mixed":
+            downstream_ranges = downstream_dataset.balanced_language_ranges
+        if self.alignment_batching == "mixed" and downstream_ranges is None:
             return super().get_train_dataloader()
 
         if self.accelerator.num_processes != 1 or self.args.n_gpu > 1:
@@ -126,9 +138,13 @@ class AlternativeRoutingTrainer(Trainer):
         if self.total_steps != self.args.max_steps:
             raise ValueError("same_pair requires total_steps == max_steps > 0.")
 
-        dataset = self.train_dataset
+        if downstream_ranges and self.training_type == "alternative":
+            if self.args.max_steps % 2 or self.schedule != ("alignment", "downstream"):
+                raise ValueError("WMT requires an even step budget and exact alignment/downstream alternation.")
         sampler = PairBatchSampler(
-            pair_ranges=dataset.alignment_dataset.pair_ranges,
+            pair_ranges=(dataset.alignment_dataset.pair_ranges
+                         if self.alignment_batching == "same_pair"
+                         else {"mixed": (0, len(dataset.alignment_dataset))}),
             downstream_size=len(dataset.downstream_dataset),
             batch_size=self._train_batch_size,
             num_steps=self.args.max_steps,
@@ -138,6 +154,11 @@ class AlternativeRoutingTrainer(Trainer):
                 if self.args.data_seed is not None else self.args.seed
             ),
             objective_at=self.objective_at,
+            downstream_ranges=(
+                None if downstream_sampling == "proportional"
+                else downstream_ranges
+            ),
+            downstream_sampling=downstream_sampling,
         )
         loader = DataLoader(
             dataset,
@@ -254,11 +275,37 @@ class AlternativeRoutingTrainer(Trainer):
 
         inputs["forward_type"] = objective
 
-        loss = super().training_step(
-            model,
-            inputs,
-            num_items_in_batch,
-        )
+        micro_size = self.downstream_micro_batch_size
+        if objective == "downstream" and micro_size and micro_size < inputs["downstream"]["input_ids"].size(0):
+            data = inputs["downstream"]
+            batch_size = data["input_ids"].size(0)
+            total_tokens = (data["labels"][:, 1:] != -100).sum().item()
+            if not total_tokens:
+                raise ValueError("SFT batch has no supervised next-token labels.")
+            losses = []
+            try:
+                for start in range(0, batch_size, micro_size):
+                    micro = {
+                        key: value[start:start + micro_size]
+                        if ((torch.is_tensor(value) and value.ndim and value.size(0) == batch_size)
+                            or (isinstance(value, (list, tuple)) and len(value) == batch_size))
+                        else value
+                        for key, value in data.items()
+                    }
+                    num_tokens = (micro["labels"][:, 1:] != -100).sum().item()
+                    if not num_tokens:
+                        continue
+                    # HF CE is a token mean. Weight by supervised token counts,
+                    # not equally by microbatches with different target lengths.
+                    self._downstream_loss_weight = num_tokens / total_tokens
+                    losses.append(super().training_step(
+                        model, {**inputs, "downstream": micro}, num_items_in_batch,
+                    ))
+            finally:
+                self._downstream_loss_weight = None
+            loss = sum(losses)
+        else:
+            loss = super().training_step(model, inputs, num_items_in_batch)
 
         # Trainer divides the returned loss by gradient accumulation steps.
         # Undo that scaling so logged losses remain comparable.
@@ -292,6 +339,8 @@ class AlternativeRoutingTrainer(Trainer):
         # third-party models can still return just their scalar loss.
         if observe and "gap_distance" in outputs:
             self._record_alignment_training(inputs["alignment"], outputs)
+        if self._downstream_loss_weight is not None and inputs.get("forward_type") == "downstream":
+            loss = loss * self._downstream_loss_weight
         return (loss, outputs) if return_outputs else loss
 
     def _observation_context(self, phase):

@@ -22,10 +22,20 @@ from alignment_logging import (
     batch_record,
 )
 from config import ALIGNMENT_REFERENCES, PAIR_BATCH_LOSSES, resolve_alignment_loss
-from data_utils import AlignmentDataset, MassiveDataset, make_sample_id
+from comet22_scoring import score_comet22
+from data_utils import AlignmentDataset, MassiveDataset, WMT23Dataset, WMT25Dataset, make_sample_id
 from models import CustomModel
 from samplers import AlignmentEvalBatchSampler
 
+import math
+
+WMT_DATASETS = {
+    "wmt23": WMT23Dataset,
+    "wmt25": WMT25Dataset,
+}
+
+WMT_METRICS = ("none", "chrf", "sacrebleu", "comet22")
+WMT_EOS_POLICY = "generation_config_plus_tokenizer_v1"
 
 def parse_eval_args():
     parser = argparse.ArgumentParser(
@@ -53,12 +63,18 @@ def parse_eval_args():
         help="Evaluate task-trained languages, unseen languages, or both.",
     )
     parser.add_argument(
+        "--alignment_language_scope",
+        choices=["in", "out", "both"],
+        default=None,
+        help="Restrict retrieval to these scopes; downstream tasks keep --language_scope. Defaults to the same scopes.",
+    )
+    parser.add_argument(
         "--tasks",
         type=str,
         nargs="+",
-        default=["alignment", "massive"],
-        choices=["alignment", "massive"],
-        help="Evaluation tasks to run.",
+        default=None,
+        choices=["alignment", "massive", "wmt23", "wmt25"],
+        help="Evaluation tasks. Defaults to alignment plus the checkpoint's downstream task.",
     )
     parser.add_argument(
         "--alignment_batch_size",
@@ -78,12 +94,18 @@ def parse_eval_args():
         default=256,
         help="Number of retrieval queries processed at once.",
     )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=64,
-        help="Maximum number of tokens generated for a MASSIVE answer.",
-    )
+    parser.add_argument("--max_new_tokens", type=int, default=64,
+                        help="Generation budget for MASSIVE; WMT uses task-specific options.")
+    for task, default_metric in (
+        ("wmt23", "sacrebleu"),
+        ("wmt25", "none"),
+    ):
+        parser.add_argument(f"--{task}_batch_size", type=int, default=1)
+        parser.add_argument(f"--{task}_max_new_tokens", type=int, default=4096)
+        parser.add_argument(f"--{task}_metric", choices=WMT_METRICS, default=default_metric, help=f"{default_metric} requires references for every row and optional sacrebleu.")
+        parser.add_argument(f"--{task}_data_dir", type=str, default=None, help=f"Override the prepared data directory saved in the checkpoint.")
+
+
     parser.add_argument(
         "--save_alignment_embeddings",
         action=argparse.BooleanOptionalAction,
@@ -96,6 +118,14 @@ def parse_eval_args():
         default=True,
         help="Stream scalar diagnostics for every alignment sample to JSONL.",
     )
+
+    # Calculate Metrics
+    parser.add_argument("--comet22_python", type=str, default=None,
+                        help="Separate Python with requirements-comet22.txt installed.")
+    parser.add_argument("--comet22_checkpoint", type=str, default=None)
+    parser.add_argument("--comet22_batch_size", type=int, default=16)
+    parser.add_argument("--comet22_gpus", type=int, choices=[0, 1], default=0)
+
     parser.add_argument(
         "--eval_sample_log_limit",
         type=int,
@@ -117,10 +147,33 @@ def parse_eval_args():
 
     return parser.parse_args()
 
+def wmt_options(args, task):
+    if task == "wmt23":
+        return {
+            "batch_size": args.wmt23_batch_size,
+            "max_new_tokens": args.wmt23_max_new_tokens,
+            "metric": args.wmt23_metric,
+        }
+
+    if task == "wmt25":
+        return {
+            "batch_size": args.wmt25_batch_size,
+            "max_new_tokens": args.wmt25_max_new_tokens,
+            "metric": args.wmt25_metric,
+        }
+
+    raise ValueError(f"Unsupported WMT task: {task!r}")
 
 def validate_eval_args(args):
     if args.eval_sample_log_limit < 0:
         raise ValueError("eval_sample_log_limit must be nonnegative.")
+
+    for task in args.tasks or ("wmt23", "wmt25"):
+        if getattr(args, f"{task}_metric", None) == "comet22":
+            if not getattr(args, "comet22_python", None):
+                raise ValueError("--comet22_python is required for COMET-22; see requirements-comet22.txt.")
+            if args.comet22_batch_size <= 0:
+                raise ValueError("comet22_batch_size must be positive.")
 
     positive_integer_arguments = {
         "alignment_batch_size": args.alignment_batch_size,
@@ -136,6 +189,9 @@ def validate_eval_args(args):
             raise ValueError(
                 f"{argument_name} must be positive, got {argument_value}."
             )
+    alignment_scope = getattr(args, "alignment_language_scope", None)
+    if alignment_scope is not None and not set(get_language_scopes(alignment_scope)) <= set(get_language_scopes(args.language_scope)):
+        raise ValueError("alignment_language_scope must be contained in language_scope.")
 
 
 def write_json(path, payload):
@@ -1270,6 +1326,289 @@ def evaluate_massive_scope(
     return metrics
 
 
+def build_wmt_evaluation_samples(dataset):
+    # Do not call supervised __getitem__: gold targets never enter prompts.
+    return [dataset.get_generation_sample(index) for index in range(len(dataset))]
+
+
+def wmt_generation_eos_ids(model, tokenizer):
+    """Honor both model stop tokens and the tokenizer's chat answer terminator."""
+    generation_config = getattr(model.basemodel, "generation_config", None)
+    eos_ids = getattr(generation_config, "eos_token_id", None)
+    if isinstance(eos_ids, int):
+        eos_ids = [eos_ids]
+    eos_ids = set(eos_ids or [])
+    if tokenizer.eos_token_id is not None:
+        eos_ids.add(tokenizer.eos_token_id)
+    return sorted(eos_ids)
+
+
+@torch.inference_mode()
+def generate_wmt_predictions(model, tokenizer, dataset, dataloader, max_new_tokens,
+                               sample_recorder=None):
+    predictions = []
+    input_device = get_model_input_device(model)
+    original_padding_side = tokenizer.padding_side
+    config = getattr(model.basemodel.config, "text_config", model.basemodel.config)
+    limits = [getattr(config, "max_position_embeddings", None),
+              getattr(tokenizer, "model_max_length", None)]
+    limits = [limit for limit in limits if isinstance(limit, int) and 0 < limit < 10**9]
+    eos_ids = set(wmt_generation_eos_ids(model, tokenizer))
+    print(f"[WMT] batch_size={dataloader.batch_size} max_new_tokens={max_new_tokens} "
+          f"eos_policy={WMT_EOS_POLICY} eos_token_ids={sorted(eos_ids)}", flush=True)
+    try:
+        tokenizer.padding_side = "left"
+        for batch_index, batch in enumerate(dataloader, start=1):
+            prompts = [
+                dataset._apply_chat_template(text, target=None, lang=lang)[0]
+                for text, lang in zip(batch["utt"], batch["lang"])
+            ]
+            tokens = tokenizer(prompts, add_special_tokens=False, padding=True,
+                               truncation=False, return_tensors="pt")
+            prompt_width = tokens["input_ids"].shape[1]
+            if limits and prompt_width + max_new_tokens > min(limits):
+                raise ValueError(
+                    f"WMT prompt ({prompt_width}) + generation budget ({max_new_tokens}) "
+                    f"exceeds context {min(limits)}: {batch['sample_id']}. No input was truncated."
+                )
+            tokens = move_tensors_to_device(tokens, input_device)
+            generated = model.basemodel.generate(
+                **tokens, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                **({"eos_token_id": sorted(eos_ids)} if eos_ids else {}),
+            )[:, prompt_width:]
+            answers = tokenizer.batch_decode(generated, skip_special_tokens=True)
+            sample_indices = set(sample_recorder.select_indices("downstream", batch["lang"])) if sample_recorder else set()
+            for index, answer in enumerate(answers):
+                row = batch["item"][index]
+                output_ids = generated[index].tolist()
+                eos_position = next((i for i, token in enumerate(output_ids) if token in eos_ids), None)
+                prediction = {
+                    "sample_id": batch["sample_id"][index], "lang": batch["lang"][index],
+                    "direction": row["direction"], "source": batch["utt"][index],
+                    "target": batch["target"][index], "prediction": answer.strip(),
+                    "doc_id": row.get("doc_id"), "dataset_id": row.get("dataset_id"),
+                    "example_id": row["example_id"], "domain": row.get("domain"),
+                    "generation_limit_reached": eos_position is None and len(output_ids) >= max_new_tokens,
+                    "source_paragraphs": len(row["source_normalized"].split("\n\n")),
+                    "prediction_paragraphs": len(answer.strip().split("\n\n")),
+                }
+                predictions.append(prediction)
+                if index in sample_indices:
+                    sample_recorder.add("downstream", batch["lang"][index],
+                                        {**prediction, "prompt_text": prompts[index], "origin_data": row}, {})
+            if batch_index == 1 or batch_index % 25 == 0:
+                print(f"[WMT] generated batch {batch_index}/{len(dataloader)}")
+    finally:
+        tokenizer.padding_side = original_padding_side
+    return predictions
+
+
+def evaluate_wmt25_predictions(predictions, metric="none"):
+    if not predictions:
+        raise ValueError("No WMT25 predictions were generated.")
+    if metric == "chrf" and any(not row["target"] for row in predictions):
+        raise ValueError("WMT25 chrF requires a reference for every document; system outputs are not references.")
+    scorer = None
+    if metric == "chrf":
+        from sacrebleu.metrics import CHRF
+        scorer = CHRF()
+    by_language = {}
+    for language in sorted({row["lang"] for row in predictions}):
+        rows = [row for row in predictions if row["lang"] == language]
+        score = scorer.corpus_score([row["prediction"] for row in rows], [[row["target"] for row in rows]]) if scorer else None
+        by_language[language] = {
+            "direction": f"en-{language}", "num_examples": len(rows),
+            "num_references": sum(bool(row["target"]) for row in rows),
+            "generation_limit_hits": sum(row["generation_limit_reached"] for row in rows),
+            "paragraph_mismatches": sum(row["source_paragraphs"] != row["prediction_paragraphs"] for row in rows),
+            "chrf": score.score if score is not None else None,
+            "metric_signature": str(scorer.get_signature()) if scorer else None,
+        }
+    return {
+        "status": "scored" if scorer else "generation_only", "metric": metric,
+        "by_language": by_language,
+        "macro_average": {"chrf": sum(row["chrf"] for row in by_language.values()) / len(by_language) if scorer else None},
+    }
+
+def wmt_scorer(metric, language):
+    if metric == "chrf":
+        from sacrebleu.metrics import CHRF
+        return CHRF(char_order=6, word_order=0, beta=2)
+
+    if metric == "sacrebleu":
+        from sacrebleu.metrics import BLEU
+        return BLEU(trg_lang=language.rsplit("-", 1)[-1])
+
+    if metric in ("none", "comet22"):
+        return None
+
+    raise ValueError(f"Unsupported MT metric: {metric!r}")
+
+def validate_wmt_references(rows, metric):
+    if metric not in WMT_METRICS:
+        raise ValueError(f"Unsupported MT metric: {metric!r}")
+
+    if not rows:
+        raise ValueError("The WMT evaluation set is empty.")
+
+    if metric != "none":
+        for row in rows:
+            if (
+                not isinstance(row["target"], str)
+                or not row["target"].strip()
+            ):
+                raise ValueError(
+                    f"{metric} requires a reference: {row['sample_id']}"
+                )
+
+def evaluate_wmt_predictions(predictions, metric="none", args=None):
+    validate_wmt_references(predictions, metric)
+
+    for row in predictions:
+        if not isinstance(row["prediction"], str):
+            raise TypeError(
+                f"Prediction must be a string: {row['sample_id']}"
+            )
+
+    comet_scores, scorer_metadata = None, {}
+    if metric == "comet22":
+        comet_scores, scorer_metadata = score_comet22(predictions, args)
+
+    by_language = {}
+
+    for language in sorted({row["lang"] for row in predictions}):
+        indices = [
+            i for i, row in enumerate(predictions)
+            if row["lang"] == language
+        ]
+        rows = [predictions[i] for i in indices]
+        scorer = wmt_scorer(metric, language)
+        score, signature = None, None
+
+        if scorer is not None:
+            score = float(
+                scorer.corpus_score(
+                    [row["prediction"] for row in rows],
+                    [[row["target"] for row in rows]],
+                ).score
+            )
+            signature = str(scorer.get_signature())
+
+        elif metric == "comet22":
+            score = (
+                sum(comet_scores[i] for i in indices)
+                / len(indices)
+            )
+
+        if score is not None and not math.isfinite(score):
+            raise ValueError(
+                f"Non-finite {metric} score for {language}."
+            )
+
+        result = {
+            "direction": language if "-" in language else f"en-{language}",
+            "num_examples": len(rows),
+            "num_references": sum(bool(row["target"]) for row in rows),
+            "generation_limit_hits": sum(
+                row["generation_limit_reached"] for row in rows
+            ),
+            "paragraph_mismatches": sum(
+                row["source_paragraphs"] != row["prediction_paragraphs"]
+                for row in rows
+            ),
+            "metric_signature": signature,
+            **dict.fromkeys(WMT_METRICS[1:]),
+        }
+
+        if metric != "none":
+            result[metric] = score
+        if metric == "comet22":
+            result["comet22_x100"] = score * 100
+
+        by_language[language] = result
+
+    macro = dict.fromkeys(WMT_METRICS[1:])
+    if metric != "none":
+        macro[metric] = (
+            sum(row[metric] for row in by_language.values())
+            / len(by_language)
+        )
+    if metric == "comet22":
+        macro["comet22_x100"] = macro[metric] * 100
+
+    return {
+        "status": "generation_only" if metric == "none" else "scored",
+        "metric": metric,
+        "by_language": by_language,
+        "macro_average": macro,
+        "scorer_metadata": scorer_metadata,
+    }
+
+def evaluate_wmt_scope(
+    args,
+    experiment_config,
+    model,
+    tokenizer,
+    scope,
+    scope_output_dir,
+    sample_recorder=None,
+    *,
+    task,
+):
+    options = wmt_options(args, task)
+    metric = options["metric"]
+
+    if options["batch_size"] <= 0 or options["max_new_tokens"] <= 0:
+        raise ValueError("WMT batch size and max_new_tokens must be positive.")
+
+    dataset = WMT_DATASETS[task](
+        experiment_config,
+        tokenizer,
+        split=f"{scope}_{args.split}",
+    )
+    samples = build_wmt_evaluation_samples(dataset)
+
+    validate_wmt_references(samples, metric)
+
+    for language in dataset.all_data:
+        wmt_scorer(metric, language)
+
+    dataloader = DataLoader(
+        samples,
+        batch_size=options["batch_size"],
+        shuffle=False,
+        collate_fn=collate_massive_evaluation_samples,
+    )
+
+    predictions = generate_wmt_predictions(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        dataloader=dataloader,
+        max_new_tokens=options["max_new_tokens"],
+        sample_recorder=sample_recorder,
+    )
+
+    for language in dataset.all_data:
+        write_jsonl(
+            scope_output_dir / f"{task}_predictions.{language}.jsonl",
+            [
+                row for row in predictions
+                if row["lang"] == language
+            ],
+        )
+
+    metrics = evaluate_wmt_predictions(predictions, metric, args)
+    metrics["schema_version"] = 2
+    metrics["dataset_metadata"] = dataset.dataset_metadata
+
+    write_json(
+        scope_output_dir / f"{task}_metrics.json",
+        metrics,
+    )
+    return metrics
+
 def main():
     args = parse_eval_args()
     validate_eval_args(args)
@@ -1282,6 +1621,48 @@ def main():
         )
 
     experiment_config = load_experiment_config(checkpoint_path)
+    downstream_task = experiment_config.downstream_task
+
+    if downstream_task not in {"massive", "wmt23", "wmt25"}:
+        raise ValueError(
+            f"Unsupported checkpoint downstream_task: {downstream_task!r}"
+        )
+
+    if args.tasks is None:
+        args.tasks = ["alignment", downstream_task]
+    invalid_tasks = set(args.tasks) - {"alignment", downstream_task}
+    if invalid_tasks:
+        raise ValueError(
+            f"Checkpoint downstream_task={downstream_task!r}, "
+            f"but requested incompatible tasks={sorted(invalid_tasks)}."
+        )
+
+    if args.wmt23_data_dir is not None:
+        experiment_config.wmt23_data_dir = str(
+            Path(args.wmt23_data_dir).expanduser().resolve()
+        )
+
+    if args.wmt25_data_dir is not None:
+        experiment_config.wmt25_data_dir = str(
+            Path(args.wmt25_data_dir).expanduser().resolve()
+        )
+
+    if (
+        "wmt23" in args.tasks
+        and args.split == "validation"
+        and args.language_scope in {"out", "both"}
+    ):
+        raise ValueError(
+            "The prepared WMT23 data has no out-language validation split. "
+            "Use validation/in or test/in,out,both."
+        )
+    if "wmt25" in args.tasks:
+        for scope in get_language_scopes(args.language_scope):
+            if f"{scope}_{args.split}" not in WMT25Dataset.SPLIT_MAPPING:
+                raise ValueError(
+                    "WMT25 evaluation supports --split validation/test "
+                    "with --language_scope in/out/both."
+                )
     if (
         experiment_config.alignment_loss in PAIR_BATCH_LOSSES
         and "alignment" in args.tasks
@@ -1294,6 +1675,10 @@ def main():
     )
 
     scopes = get_language_scopes(args.language_scope)
+    alignment_scopes = (
+        get_language_scopes(args.alignment_language_scope or args.language_scope)
+        if "alignment" in args.tasks else []
+    )
     evaluation_root = get_evaluation_root(args, checkpoint_path)
     split_output_dir = evaluation_root / args.split
     split_output_dir.mkdir(parents=True, exist_ok=True)
@@ -1308,9 +1693,18 @@ def main():
         "checkpoint_path": str(checkpoint_path),
         "split": args.split,
         "language_scopes": scopes,
+        "alignment_language_scopes": alignment_scopes,
         "tasks": args.tasks,
         "alignment_batch_size": args.alignment_batch_size,
         "massive_batch_size": args.massive_batch_size,
+        "wmt25_batch_size": args.wmt25_batch_size,
+        "wmt25_max_new_tokens": args.wmt25_max_new_tokens,
+        "wmt25_metric": args.wmt25_metric,
+        "wmt23_batch_size": args.wmt23_batch_size,
+        "wmt23_max_new_tokens": args.wmt23_max_new_tokens,
+        "wmt23_metric": args.wmt23_metric,
+        "wmt_eos_policy": WMT_EOS_POLICY,
+        "wmt_eos_token_ids": wmt_generation_eos_ids(model, tokenizer),
         "retrieval_chunk_size": args.retrieval_chunk_size,
         "max_new_tokens": args.max_new_tokens,
         "save_alignment_embeddings": args.save_alignment_embeddings,
@@ -1340,7 +1734,7 @@ def main():
             scope_results = {}
             sample_recorder = EvalSampleRecorder(args.eval_sample_log_limit)
 
-            if "alignment" in args.tasks:
+            if "alignment" in args.tasks and scope in alignment_scopes:
                 scope_results["alignment"] = evaluate_alignment_scope(
                     args=args,
                     experiment_config=experiment_config,
@@ -1361,6 +1755,19 @@ def main():
                     scope_output_dir=scope_output_dir,
                     sample_recorder=sample_recorder,
                 )
+
+            for task in args.tasks:
+                if task in WMT_DATASETS:
+                    scope_results[task] = evaluate_wmt_scope(
+                        args=args,
+                        experiment_config=experiment_config,
+                        model=model,
+                        tokenizer=tokenizer,
+                        scope=scope,
+                        scope_output_dir=scope_output_dir,
+                        sample_recorder=sample_recorder,
+                        task=task,
+                    )
 
             sample_recorder.save(scope_output_dir)
             evaluation_metadata["results"][scope] = scope_results

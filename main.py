@@ -24,7 +24,7 @@ from transformers import (
 
 from config import ALIGNMENT_REFERENCES, parse_args, validate_gap_config
 from custom_trainer import AlternativeRoutingTrainer
-from data_utils import AlignmentDataset, CombinedDataset, MassiveDataset
+from data_utils import AlignmentDataset, CombinedDataset, MassiveDataset, WMT23Dataset, WMT25Dataset
 from models import CustomModel
 from utils import resolve_lora_target_modules
 
@@ -49,8 +49,10 @@ def build_run_name(args):
         *args.training_lang,
     ]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    task_tag = f"__task_{args.downstream_task}" if args.downstream_task != "massive" else ""
     return (
         f"{model_tag}__{args.training_type}__{args.alignment_loss}"
+        f"{task_tag}"
         f"__in_{'-'.join(in_languages)}"
         f"__out_{'-'.join(args.out_inference_lang)}"
         f"__{timestamp}"
@@ -100,6 +102,8 @@ def build_eval_datasets(args, tokenizer):
     """
     anchor_language = args.training_anchor_langs
     eval_datasets = {}
+    downstream_task = getattr(args, "downstream_task", "massive")
+    task_tag = f"__task_{downstream_task}" if downstream_task != "massive" else ""
 
     language_scopes = (
         ("in", [anchor_language, *args.training_lang]),
@@ -112,7 +116,7 @@ def build_eval_datasets(args, tokenizer):
 
         split = f"{scope}_validation"
 
-        for language in languages:
+        for language in (languages if downstream_task == "massive" else []):
             eval_datasets[f"massive_{scope}_{language}"] = CombinedDataset(
                 downstream_dataset=MassiveDataset(
                     args,
@@ -136,6 +140,50 @@ def build_eval_datasets(args, tokenizer):
                     lang_pairs=[language_pair],
                 ),
             )
+
+    # WMT out-language official documents are final tests without references.    # WMT validation measures translation loss on both seen and unseen languages.
+    # if downstream_task == "wmt25":
+    #     wmt_scopes = (
+    #         ("in", WMT25Dataset.training_langs),
+    #         ("out", WMT25Dataset.out_inference_langs),
+    #     )
+
+    #     for scope, languages in wmt_scopes:
+    #         if args.eval_language_scope not in ("both", scope):
+    #             continue
+
+    #         for language in languages:
+    #             eval_datasets[f"wmt25_{scope}_{language}"] = CombinedDataset(
+    #                 downstream_dataset=WMT25Dataset(
+    #                     args,
+    #                     tokenizer,
+    #                     split=f"{scope}_validation",
+    #                     languages=[language],
+    #                 ),
+    #             )
+    if downstream_task in {"wmt25", "wmt23"}:
+        wmt_dataset_class = {
+            "wmt23": WMT23Dataset,
+            "wmt25": WMT25Dataset,
+        }[downstream_task]
+
+        wmt_scopes = [("in", args.training_lang if downstream_task == "wmt23" else wmt_dataset_class.training_langs)]
+        if downstream_task == "wmt25":
+            wmt_scopes.append(("out", wmt_dataset_class.out_inference_langs))
+
+        for scope, languages in wmt_scopes:
+            if args.eval_language_scope not in ("both", scope):
+                continue
+
+            for language in languages:
+                eval_datasets[f"{downstream_task}_{scope}_{language}"] = CombinedDataset(
+                    downstream_dataset=wmt_dataset_class(
+                        args,
+                        tokenizer,
+                        split=f"{scope}_validation",
+                        languages=[language],
+                    ),
+                )
 
     return eval_datasets
 
@@ -244,9 +292,10 @@ def configure_wandb(args, model_tag):
         [args.training_anchor_langs, *args.training_lang]
     )
     out_language_tag = "-".join(args.out_inference_lang)
+    task_tag = "__task_wmt25" if getattr(args, "downstream_task", "massive") == "wmt25" else ""
     os.environ.setdefault(
         "WANDB_RUN_GROUP",
-        f"{model_tag}__in_{in_language_tag}__out_{out_language_tag}",
+        f"{model_tag}__in_{in_language_tag}__out_{out_language_tag}{task_tag}",
     )
     os.environ.setdefault(
         "WANDB_TAGS",
@@ -257,6 +306,7 @@ def configure_wandb(args, model_tag):
                 model_tag,
                 f"in:{in_language_tag}",
                 f"out:{out_language_tag}",
+                f"downstream_task:{getattr(args, 'downstream_task', 'massive')}",
             ]
         ),
     )
@@ -270,6 +320,30 @@ def configure_wandb(args, model_tag):
 def main():
     args = parse_args()
     validate_gap_config(args)
+    if args.downstream_task == "wmt23":
+        if not args.wmt23_data_dir:
+            raise ValueError("--wmt23_data_dir is required.")
+
+        args.wmt23_data_dir = str(Path(args.wmt23_data_dir).expanduser().resolve())
+        WMT23Dataset.validate_prepared_manifest(args)
+        if args.alignment_batching != "same_pair":
+            raise ValueError("WMT23 requires alignment_batching=same_pair.")
+        expected = {
+            "transfer_only": {"alignment": 0, "downstream": 50000},
+            "contrastive_only": {"alignment": 50000, "downstream": 0},
+            "contrastive_then_transfer": {"alignment": 50000, "downstream": 50000},
+            "alternative": {"alignment": 50000, "downstream": 50000},
+        }
+        actual = planned_objective_updates(args.training_type, args.num_steps)
+        if actual != expected[args.training_type]:
+            raise ValueError(f"WMT23 objective budget mismatch: {actual}; expected {expected[args.training_type]}.")
+    if args.downstream_task == "wmt25":
+        if not args.wmt25_data_dir:
+            raise ValueError("--downstream_task wmt25 requires --wmt25_data_dir.")
+        args.wmt25_data_dir = str(Path(args.wmt25_data_dir).expanduser().resolve())
+        if not (Path(args.wmt25_data_dir) / "manifest.json").is_file():
+            raise FileNotFoundError("Prepare WMT25 data with scripts/prepare_wmt25.py first.")
+        WMT25Dataset.validate_prepared_manifest(args)
     args.wandb_run_name = build_run_name(args)
 
     model_folder = path_safe_name(
@@ -384,11 +458,11 @@ def main():
         tokenizer=tokenizer,
         split="train",
     )
-    massive_dataset = MassiveDataset(
-        args,
-        tokenizer=tokenizer,
-        split="train",
-    )
+    downstream_dataset = {
+        "massive": MassiveDataset,
+        "wmt25": WMT25Dataset,
+        "wmt23": WMT23Dataset
+    }[args.downstream_task](args, tokenizer=tokenizer, split="train")
     
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -400,7 +474,7 @@ def main():
     )
     combined_dataset = CombinedDataset(
         alignment_dataset,
-        massive_dataset,
+        downstream_dataset,
         num_total_examples,
     )
     eval_datasets = build_eval_datasets(args, tokenizer)
@@ -422,18 +496,25 @@ def main():
             for language_pair, dataset
             in alignment_dataset.all_data.items()
         },
-        "downstream_dataset_size": len(massive_dataset),
+        "downstream_dataset_size": len(downstream_dataset),
+        "downstream_sampling": (
+            "language_balanced_per_optimizer_update"
+            if getattr(downstream_dataset, "downstream_sampling", "proportional") == "language_balanced"
+            else getattr(downstream_dataset, "downstream_sampling", "proportional")
+        ),
+        "downstream_micro_batch_size": args.downstream_micro_batch_size or args.batch_size,
+        "downstream_corpus_profile": getattr(downstream_dataset, "manifest", {}).get("corpus_profile"),
         "downstream_language_sizes": {
             language: len(dataset)
             for language, dataset
-            in massive_dataset.all_data.items()
+            in downstream_dataset.all_data.items()
         },
         "eval_dataset_sizes": {
             name: len(dataset)
             for name, dataset in eval_datasets.items()
         },
         "alignment_dataset_metadata": alignment_dataset.dataset_metadata,
-        "downstream_dataset_metadata": massive_dataset.dataset_metadata,
+        "downstream_dataset_metadata": downstream_dataset.dataset_metadata,
         "eval_alignment_dataset_metadata": {
             name: dataset.alignment_dataset.dataset_metadata
             for name, dataset in eval_datasets.items()

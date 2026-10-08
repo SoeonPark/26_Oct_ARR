@@ -69,6 +69,43 @@ class GapLossTests(unittest.TestCase):
         loss.backward()
         torch.testing.assert_close(target.grad, torch.zeros_like(target))
 
+    def test_alignment_logit_slicing_preserves_embeddings_loss_and_gradients(self):
+        from transformers import LlamaConfig, LlamaForCausalLM
+        torch.manual_seed(7)
+        base = LlamaForCausalLM(LlamaConfig(vocab_size=32, hidden_size=16, intermediate_size=32,
+                                          num_hidden_layers=2, num_attention_heads=2,
+                                          num_key_value_heads=2, use_cache=False))
+        original_forward = base.forward
+        batch = {
+            "source_input_ids": torch.tensor([[1, 2, 3], [4, 5, 0], [6, 7, 8]]),
+            "target_input_ids": torch.tensor([[9, 10, 11], [12, 13, 0], [14, 15, 16]]),
+            "source_attention_mask": torch.tensor([[1, 1, 1], [1, 1, 0], [1, 1, 1]]),
+            "target_attention_mask": torch.tensor([[1, 1, 1], [1, 1, 0], [1, 1, 1]]),
+            "lang_pair": ["cs-en"] * 3,
+        }
+        for position, layer in (("last_token", -1), ("mean", 1)):
+            config = SimpleNamespace(alignment_loss="centered_infonce", alignment_temperature=0.05,
+                                     alignment_hidden_state_position=position, alignment_hidden_state_layer=layer)
+            model = CustomModel(config, base).eval()
+            base.zero_grad(set_to_none=True)
+            optimized = model(alignment=batch)
+            optimized["loss"].backward()
+            gradients = {name: p.grad.clone() for name, p in base.named_parameters() if p.grad is not None}
+            base.zero_grad(set_to_none=True)
+
+            def full_logits(**kwargs):
+                kwargs["logits_to_keep"] = 0
+                return original_forward(**kwargs)
+
+            with patch.object(base, "forward", side_effect=full_logits):
+                reference = model(alignment=batch)
+            reference["loss"].backward()
+            for key in ("loss", "source_embeddings", "target_embeddings"):
+                torch.testing.assert_close(optimized[key], reference[key])
+            for name, parameter in base.named_parameters():
+                if name in gradients:
+                    torch.testing.assert_close(gradients[name], parameter.grad)
+
     def test_population_variance_of_raw_distances(self):
         source = torch.zeros(2, 2, requires_grad=True)
         target = torch.tensor([[3., 4.], [0., 1.]], requires_grad=True)

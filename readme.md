@@ -29,13 +29,98 @@ Ours 후보는 ③ Gap Distance, ④ Centered Cosine, ⑤ Gap Direction Cosine I
 ```
 conda create -n octarr python=3.11 -y
 conda activate octarr
-pip install -r requirements.txt
-
-# If CUDA driver error occurs,
-python -m pip install --force-reinstall \
-  torch==2.5.1 \
-  --index-url https://download.pytorch.org/whl/cu121 
+python -m pip install -r requirements.txt
 ```
+
+학습 의존성은 2026-10-08 실행 환경의 핵심 버전으로 고정했다.
+Qwen3.5 학습 환경과 COMET 환경은 분리한다. 학습 환경의 torch를 COMET용
+2.5.1로 낮추지 않는다. 새 서버의 CUDA/드라이버 호환성은 아래 preflight로 확인한다.
+
+## 다른 서버에서 세 실험 순차 실행 (2026-10-08)
+
+실행 순서는 다음과 같다. 모두 **BF16, 최종층 -1, seed 42, same_pair,
+batch 16, 100,000 updates (50,000 representation + 50,000 SFT)**다.
+
+1. Qwen/Qwen3.5-2B — MASSIVE — InfoNCE then SFT.
+2. meta-llama/Llama-3.2-1B-Instruct — MT — Gap Distance then SFT.
+3. Qwen/Qwen3.5-2B — MT — Gap Distance then SFT.
+
+각 학습의 최종 adapter를 검증하고 **해당 평가까지 끝낸 뒤** 다음 실험으로
+넘어간다. MASSIVE는 In Retrieval과 In/Out Slot F1·EM, MT는 In Retrieval과
+In BLEU·COMET-22를 평가한다. Out Retrieval은 실행하지 않는다.
+Qwen MT의 SFT microbatch는 8이며 optimizer update당 유효 batch는 16이다.
+MT 생성 한도 16,384, MASSIVE 생성 한도 128, 평가 batch 16을 유지한다.
+
+**1. 새 서버에서 코드와 두 환경 준비**
+
+```bash
+git pull --ff-only origin main
+conda create -n octarr python=3.11 -y
+conda activate octarr
+python -m pip install -r requirements.txt
+python -m venv .venv-comet22
+.venv-comet22/bin/python -m pip install -r requirements-comet22.txt
+# Llama 저장소 접근 권한이 있는 Hugging Face 계정으로 로그인한다.
+hf auth login
+mkdir -p data/wmt23_alma_ja_opus
+```
+
+이미 환경이 있으면 생성 단계를 생략하고 의존성을 갱신한다. COMET 환경에도
+CUDA 지원 torch가 필요하다. 모델 가중치·MASSIVE·OPUS·COMET은 캐시가 없으면
+처음 실행할 때 다운로드한다. Git에는 데이터·가중치·결과·로그를 포함하지 않는다.
+
+**2. 준비된 MT 데이터 복사**
+
+기존 서버의 `data/wmt23_alma_ja_opus`는 캐시 디렉터리를 가리키는 심볼릭
+링크다. 기존 서버에서 아래처럼 **`-L`로 실제 파일을 복사**한다.
+`USER@NEW_SERVER`와 대상 저장소 경로는 새 서버에 맞게 바꾼다.
+
+```bash
+rsync -aL --info=progress2 data/wmt23_alma_ja_opus/ \
+  USER@NEW_SERVER:/path/to/26_Oct_ARR/data/wmt23_alma_ja_opus/
+```
+
+복사할 실제 디렉터리는 약 300 MB다. 원시 다운로드 전체는 필요하지 않다.
+현재 실험의 `manifest.json` SHA256은 다음과 같으며 새 실행기의 기본값이다.
+
+```text
+c36ffdebbe1d3e16e23115e33003e7d14867e0ee6a8d81cfee61dafe53fab0eb
+```
+
+새 서버에서 `sha256sum data/wmt23_alma_ja_opus/manifest.json`으로 확인한다.
+기존 디렉터리를 복사할 수 없으면 `scripts/prepare_wmt23.py --output_dir
+data/wmt23_alma_ja_opus --corpus_profile alma_ja_opus --seed 42`로 준비할 수 있다.
+재생성한 manifest는 환경 메타데이터 때문에 해시가 달라질 수 있다. 이때는
+데이터 구성을 확인한 뒤 출력된 해시를 `--manifest-sha256`으로 지정한다.
+
+**3. 새 서버에서 확인 후 시작**
+
+```bash
+conda activate octarr
+python scripts/run_remote_experiments.py --gpu 0 --dry-run
+python scripts/run_remote_experiments.py --gpu 0 --check-only
+mkdir -p logs
+nohup python -u scripts/run_remote_experiments.py --gpu 0 \
+  > logs/remote_three_experiments.log 2>&1 &
+```
+
+`--gpu`는 사용할 물리 GPU 번호다. 실행기를 호출한 Python을 학습·평가에도
+사용하므로 기존 서버의 절대 Python 경로를 수정할 필요가 없다. MT 데이터를
+다른 위치에 복사했다면 모든 호출에 `--data-dir /absolute/path`를 추가한다.
+COMET 환경도 다른 위치면 `--comet-python /absolute/path/bin/python`으로 지정한다.
+기본 W&B는 disabled이며 필요하면 `--wandb-mode online`을 지정한다.
+
+`--dry-run`은 실행 설정만 출력한다. `--check-only`는 데이터 파일 checksum,
+설치 버전, CUDA/BF16, 두 모델 config 접근, COMET 환경을 확인하며 모델 가중치를
+로드하거나 학습하지 않는다. 실제 학습 속도/메모리는 새 서버에서 확인해야 한다.
+
+상태는 `logs/remote_three_experiments/state.json`, 고정 설정은 같은 디렉터리의
+`manifest.json`, 단계별 출력은 `*.evaluation.log`와 `*.retrieval.log`에 기록된다.
+평가 결과는 run별 `evaluations/remote_final_*`에 저장한다. 같은 명령을 다시
+실행하면 완료된 최종 adapter와 평가 파일을 검증해 재사용한다. 평가 실패는
+다음 학습을 막는다. 미완료 학습은 optimizer 상태가 없으므로 자동 재학습하지
+않고 해당 run 경로를 알린다. 컨트롤러만 중단되고 자식이 남았다면 종료를 기다린다.
+기존 서버의 큐는 별도이므로, 이 세 작업을 옮길 때 기존 대기 항목도 조정해야 한다.
 
 ## 1. 연구 목표와 구현된 다섯 목적함수
 
@@ -347,10 +432,10 @@ baseline 후보이다. 현재 핵심 비교는 위의 InfoNCE-Alt와 제안 방�
 | Method | Alignment updates | Task updates | Total updates | 현재 스크립트 |
 |---|---:|---:|---:|---|
 | Pretrained | 0 | 0 | 0 | 없음 |
-| Task-only | 0 | 50k | 50k | scripts/transfer_only.sh |
-| Alignment-only (A) | 50k | 0 | 50k | `scripts/contrastive_only.sh contrastive_only` |
-| Alignment → Task (A→T) | 50k | 50k | 100k | `scripts/transfer_only.sh contrastive_then_transfer` |
-| Alternating (Alt) | 50k | 50k | 100k | `scripts/contrastive_only.sh alternative` |
+| Task-only | 0 | 50k | 50k | `scripts/massive_transfer_only.sh transfer_only` |
+| Alignment-only (A) | 50k | 0 | 50k | `scripts/massive_contrastive_only.sh contrastive_only` |
+| Alignment → Task (A→T) | 50k | 50k | 100k | `scripts/massive_transfer_only.sh contrastive_then_transfer` |
+| Alternating (Alt) | 50k | 50k | 100k | `scripts/massive_contrastive_only.sh alternative` |
 
 Baseline의 A/A→T/Alt에는 ① InfoNCE를 사용하며, 제안 방법의 주 비교는
 ③④⑤의 Alt다. 보조 분석의 ② 및 제안 loss A/A→T에도 같은 budget 원칙을 적용한다.
@@ -394,7 +479,7 @@ Baseline의 A/A→T/Alt에는 ① InfoNCE를 사용하며, 제안 방법의 주 
 
 Python CLI 기본값과 현재 두 메인 큐 스크립트의 설정은 구분한다.
 
-| 항목 | `config.py` 기본값 | `contrastive_only.sh` / `transfer_only.sh` 설정 |
+| 항목 | `config.py` 기본값 | `massive_contrastive_only.sh` / `massive_transfer_only.sh` 설정 |
 |---|---|---|
 | Alignment loss | `infonce` | ③④⑤ 순회; T는 첫 loss로 한 번만 실행 |
 | Alignment batching | `mixed` | `same_pair` |
@@ -510,24 +595,23 @@ Llama-3.2-1B-Instruct, Qwen3.5-2B, Qwen2.5-1.5B-Instruct다.
 8. Ours — Gap Direction Cosine InfoNCE
 
 모델별 독립 표 3개와 출처는 [Main table](reports/main_table_20260928/main_table.md)에 있다.
-모델명(8행), Ours(3행), Method 및 평가 헤더를 병합하고,
+모델명(8행), Ours(3행), Method·평가 헤더를 병합하고,
 Alignment → In/Out → R@1·R@5·MRR, Downstream → In/Out → Slot F1·EM으로 표시한다.
-**2026-09-29T10:12:47+09:00** 원본 재검토에서 test 평가 **49개·지표 파일196개**를 검증했다.
-Main MD·CSV·Excel은 **24행 중 19행·190개 지표**이며 Qwen3.5 Gap Direction–Alt를 추가했다.
-기존 baseline 22개 run은 현재 비교 설정 일치 → same_pair → 최신 학습 run 순으로 선택했다.
+**2026-09-30T13:40:59+09:00** 재검토에서 test 평가 **52개·지표 파일208개**를 검증했다.
+Main MD·CSV·Excel은 **24행 중 21행·210개 지표**이며, 두 Qwen의 기본 InfoNCE-only를 추가했다.
+완료 baseline 후보 24개 run은 현재 비교 설정 일치 → same_pair → 최신 학습 run 순으로 선택했다.
 
 [Analysis](reports/main_table_20260928/analysis.md)는 모델별 **Task-only 1개 +
-contrastive-only/순차/Alt 각각 InfoNCE와 제안 3종**, 총 **39행 중 36행·360개 지표**를 담는다.
-Llama Gap Distance contrastive-only의 완료 결과도 반영했다.
-Transfer-only에서는 alignment loss를 사용하지 않으므로 모델당 하나의 공통 SFT 행으로 둔다.
-두 Qwen의 기본 InfoNCE-only와 Llama Gap Distance 순차는 완료 결과가 없으며,
-Main의 Pretrained 3행도 별도 test 결과가 없다.
+contrastive-only/순차/Alt 각각 InfoNCE와 제안 3종**, **39/39행·390개 지표**를 모두 담는다.
+Llama Gap Distance→SFT의 완료 재실험도 반영했다. Transfer-only는 alignment loss를
+사용하지 않아 모델당 하나의 공통 SFT 행으로 둔다. **남은 빈칸은 Main의 Pretrained 3행뿐**이다.
 
-[최신 큐 확인](reports/main_table_20260928/queue_verification.md)에서는 **29/29 완료·exit code 0**,
-GPU 0·1 모두 `finished`다. 큐 전체 완료와 비교표 전체 조합 완료는 구분한다.
-`†`는 layer8/FP16의 기존 InfoNCE로, layer-1/BF16 제안 방법과 loss만 통제한 비교가 아니다.
-`—`는 완료 test 결과 미확인이고 0.00은 측정값이다.
-[재검토 기록](reports/main_table_20260928/result_audit.md)에 빈칸 사유와 출처를 남겼다.
+[최신 평가 큐](reports/main_table_20260928/queue_verification.md)는
+`queue-20260930_114350`이며 **신규 3/3 완료·exit code 0**, GPU 0·1 모두 `finished`다.
+새 두 Qwen InfoNCE-only는 layer-1/BF16으로 제안 방법과 같다.
+`†`가 남은 기존 InfoNCE(Llama-only 및 세 모델 순차/Alt)는 layer8/FP16이므로
+제안 방법과 loss만 통제한 비교가 아니다. `—`는 미평가, 0.00은 측정값이다.
+[재검토 기록](reports/main_table_20260928/result_audit.md)에 출처와 빈칸 사유를 남겼다.
 
 | 평가 영역 | 주 지표 | 보조 지표 | 집계 방식 |
 |---|---|---|---|
@@ -737,8 +821,8 @@ subclass가 아니므로 `load_best_model_at_end=True`는 학습 종료 시점�
 
     python3 scripts/select_checkpoint.py RUN_DIR --rule massive_in --table
 
-Selection에는 **in-language validation만** 사용한다. 기본 rule이
-`massive_in`인 이유이다. fr/de/it의 validation loss로 checkpoint를 고르면
+Selection에는 **in-language validation만** 사용한다. 기본 rule은 저장된 task의
+`<task>_in`이며, contrastive-only에서는 `align_in`이다. 미학습 언어의 validation loss로 checkpoint를 고르면
 gradient에는 out-language label을 쓰지 않았더라도 모델 선택 경로로
 target-language 감독이 들어가 fully-unseen transfer 주장과 충돌한다.
 `align_out` 역시 out-language parallel data를 selection에 쓰는 것이므로
@@ -961,27 +1045,29 @@ task·언어별 샘플 64개 저장이다. 스크립트 상단에서 설정을 �
 
     conda activate octarr
     mkdir -p logs
-    nohup bash scripts/transfer_only.sh    > logs/transfer_only.log 2>&1 &      # GPU 0
-    nohup bash scripts/contrastive_only.sh > logs/contrastive_only.log 2>&1 &   # GPU 1
+    nohup bash scripts/massive_transfer_only.sh    > logs/transfer_only.log 2>&1 &      # GPU 0
+    nohup bash scripts/massive_contrastive_only.sh > logs/contrastive_only.log 2>&1 &   # GPU 1
 
-**2026-09-28 현재 활성화된 배열** 기준이다. 주석 처리된 모델/모드는 제외한다.
+**2026-09-30 현재 활성화된 배열** 기준이다. 주석 처리된 모델/모드는 제외한다.
+기존 `contrastive_only.sh` / `transfer_only.sh`는 각각 아래 `massive_*` 이름으로
+변경했다. `--downstream_task massive`를 명시하며 기존 학습 설정은 유지한다.
 
 | 스크립트 | 기본 모델 | 기본 모드 | 기본 loss | 실행 수 |
 |---|---|---|---|---:|
-| `contrastive_only.sh` | Llama-3.2-1B-Instruct, Qwen2.5-1.5B-Instruct, Qwen3.5-2B | A, Alt | ③④⑤ | 18 |
-| `transfer_only.sh` | Qwen2.5-1.5B-Instruct, Qwen3.5-2B | T | 첫 loss (검증용 ③) | 2 |
+| `massive_contrastive_only.sh` | Llama-3.2-1B-Instruct, Qwen2.5-1.5B-Instruct, Qwen3.5-2B | A | ① InfoNCE, ④ Centered InfoNCE | 6 |
+| `massive_transfer_only.sh` | Llama-3.2-1B-Instruct, Qwen2.5-1.5B-Instruct, Qwen3.5-2B | A→T | ① InfoNCE, ④ Centered InfoNCE | 6 |
 
-`transfer_only.sh contrastive_then_transfer`를 지정하면 현재 모델 2개 ×
-loss 3개로 A→T 6회가 된다. `ALIGNMENT_LOSS`는 다섯 옵션 중 하나로 제한할 때 쓴다.
-**현재 기본 큐의 ③④⑤ 실행에 InfoNCE baseline은 포함되지 않는다.**
-핵심 대조군은 `ALIGNMENT_LOSS=infonce`와 `alternative` 모드를 지정한다.
+`massive_transfer_only.sh transfer_only`로 task-only 모드를 지정할 수 있다.
+스크립트 파일명과 달리 인자 없는 기본 실행은 현재 `contrastive_then_transfer`다.
+`ALIGNMENT_LOSS`는 다섯 옵션 중 하나로 제한할 때 쓴다.
+InfoNCE-Alt는 `ALIGNMENT_LOSS=infonce`와 `alternative` 모드를 지정한다.
 다음은 학습 없이 실제 실행 명령만 확인하는 예시다.
 
 ```bash
-DRY_RUN=1 bash scripts/contrastive_only.sh
-DRY_RUN=1 bash scripts/transfer_only.sh contrastive_then_transfer
-ALIGNMENT_LOSS=infonce DRY_RUN=1 bash scripts/contrastive_only.sh alternative
-ALIGNMENT_LOSS=centered_infonce DRY_RUN=1 bash scripts/contrastive_only.sh alternative
+DRY_RUN=1 bash scripts/massive_contrastive_only.sh
+DRY_RUN=1 bash scripts/massive_transfer_only.sh contrastive_then_transfer
+ALIGNMENT_LOSS=infonce DRY_RUN=1 bash scripts/massive_contrastive_only.sh alternative
+ALIGNMENT_LOSS=centered_infonce DRY_RUN=1 bash scripts/massive_contrastive_only.sh alternative
 ```
 
 `alternative.sh`와 `contrastive_then_transfer.sh`는 별도 단일 모델용
@@ -1006,7 +1092,7 @@ python main.py \
 ```
 
 CLI 기본값은 기존 실험 호환을 위해 `infonce`다. 학습 스크립트는
-`ALIGNMENT_LOSS=gap_consistency bash scripts/contrastive_only.sh`처럼
+`ALIGNMENT_LOSS=gap_consistency bash scripts/massive_contrastive_only.sh`처럼
 선택하며 run name에 손실 종류를 포함한다. 위 Python 명령의 loss를 ①~⑤ 중
 하나로 바꾸면 된다. **②만 temperature를 사용하지 않으며 ③④⑤는 사용한다.**
 `alignment_gap_scale`은 ③에만 적용한다. 현재 SH에는 scale 전용 환경변수가
@@ -1052,10 +1138,10 @@ objective exposure를 맞추려면 method마다 num_steps가 달라야 한다.
 
 | Method | num_steps | alignment | task | 스크립트 |
 |---|---:|---:|---:|---|
-| transfer_only | 50k | 0 | 50k | transfer_only.sh |
-| contrastive_only | 50k | 50k | 0 | contrastive_only.sh |
-| contrastive_then_transfer | **100k** | 50k | 50k | transfer_only.sh |
-| alternative | **100k** | 50k | 50k | contrastive_only.sh |
+| transfer_only | 50k | 0 | 50k | massive_transfer_only.sh |
+| contrastive_only | 50k | 50k | 0 | massive_contrastive_only.sh |
+| contrastive_then_transfer | **100k** | 50k | 50k | massive_transfer_only.sh |
+| alternative | **100k** | 50k | 50k | massive_contrastive_only.sh |
 
 `contrastive_then_transfer`와 `alternative`는 두 objective를 모두 쓰므로
 num_steps가 두 배여야 한다. 이 값은 `planned_objective_updates`와
@@ -1170,3 +1256,393 @@ selection과 tuning에 쓰지 않고 최종 평가에만 사용한다.
 - [x] Gap 거리 분산, 단일 pair 배치, gradient 및 로깅 검증
 - [x] ③ Gap Distance / ④ Centered / ⑤ Gap Direction InfoNCE와 기존 경로 회귀 검증
 - [ ] Gap 분산 감소와 의미 대응/representation collapse 관계의 실험 검증
+
+## 14. WMT25 downstream MT
+
+`--downstream_task wmt25`는 decoder-only 번역 fine-tuning을 선택한다.
+OPUS-100 alignment와 MASSIVE 경로는 기존 설정을 사용한다. WMT 실행 스크립트의
+새 기본값은 **공식 recipe 전체 + 여러 목표 언어를 섞은 downstream 배치**다.
+
+### 데이터 출처와 분할
+
+WMT25는 하나의 HF train/test 코퍼스가 아니다.
+[공식 학습 recipe](https://www2.statmt.org/wmt25/mtdata/)의
+`wmt25-eng-kor`, `wmt25-eng-jpn`, `wmt25-eng-ces`에 나열된 모든 병렬
+`train` 리소스를 사용한다. `mono_train`은 사용하지 않는다. TED도 이 recipe의
+일부이지만 TED만 선택하지 않는다. 실제 corpus 목록과 입력 SHA-256은 manifest에 남는다.
+
+| 용도 | 방향 | 원천과 분할 |
+|---|---|---|
+| Train | EN→KO/JA/CS | 각 공식 recipe의 병렬 학습 자료에서 검증·평가 원문 제외 |
+| In validation | EN→KO/JA/CS | 위 학습 자료에서 언어별 500개 분리 |
+| Out validation | EN→ET/RU/AR | WMT25 평가 자료에서 공통 영어 원문 20개 분리 |
+| In test | EN→KO/JA/CS | WMT25 평가 문서에서 validation 원문 제외 |
+| Out test | EN→ET/RU/AR | WMT25 평가 문서에서 validation 원문 제외 |
+
+목표 언어 partition은 `training_langs=("ko", "ja", "cs")`,
+`out_inference_langs=("et", "ru", "ar")`다. 입력은 항상 영어이며 EN→EN 학습은 하지 않는다.
+스크립트의 OPUS alignment 언어도 같은 partition을 사용한다.
+
+공식 평가 원문은 모든 언어의 downstream train 및 in validation에서 제외한다.
+In validation 원문도 세 언어의 train 전체에서 제외한다. Out validation으로 선택한
+20개 원문은 seen/unseen 전체 test에서 제거한다. 따라서 최종 test는 공식 평가 자료의
+사용자 정의 holdout subset이며, 전체 공식 testset 결과라고 표기하지 않는다.
+Out validation은 진단용이며 checkpoint 선택에는 사용하지 않는다.
+OPUS-100과 downstream 사이의 cross-dataset overlap 제거는 별도로 구현하지 않았다.
+
+Recipe 전체 사용은 학습 출처를 확대하는 변경이다. 학습 데이터를 문서 단위로 바꾸거나
+학습·평가 도메인을 같게 만드는 변경은 아니다. In validation도 학습 코퍼스에서 분리한
+데이터이므로 최종 WMT25 문서 평가와 분포가 다를 수 있다.
+
+### 데이터 준비
+
+준비는 학습과 별도로 실행한다. Python 3.9–3.11에서:
+
+```bash
+python -m pip install mtdata==0.4.3 PyYAML sacrebleu==2.6.0
+
+# 작은 recipe만 읽어 대상 corpus 목록 확인. 데이터/출력 파일을 만들지 않는다.
+python scripts/prepare_wmt25.py \
+  --plan --corpus_profile full_recipe \
+  --mtdata_dir data/wmt25_raw \
+  --output_dir data/wmt25_full_recipe_et_ru_ar_seed42
+
+# 전체 병렬 corpus 다운로드 및 준비. 대규모 저장 공간과 전처리 시간이 필요하다.
+python scripts/prepare_wmt25.py \
+  --download --corpus_profile full_recipe \
+  --mtdata_dir data/wmt25_raw \
+  --output_dir data/wmt25_full_recipe_et_ru_ar_seed42 \
+  --seed 42 --validation_per_language 500 --out_validation_per_language 20
+```
+
+이미 mtdata로 추출했다면 `--download`를 빼고 기존 `--mtdata_dir`를 지정한다.
+원본은 `wmt25-eng-{kor,jpn,ces}/train-parts/<corpus-id>.<lang>[.gz]` 구조다.
+영어 파일은 suffix로 결정하므로 `ces-eng`와 locale suffix가 있는 리소스도 방향을 유지한다.
+UTF-8, 병렬 파일 행 수, 빈 텍스트 및 NULL 표기를 검사한다. 일부 corpus 다운로드나
+파일 검증이 실패하면 중단하며, TED로 대체하거나 누락 corpus를 조용히 제외하지 않는다.
+
+출력 디렉터리는 비어 있어야 한다. 기존 TED 디렉터리/manifest를 이름만 바꾸지 않는다.
+결과는 `train.{ko,ja,cs}.jsonl`, `validation.{ko,ja,cs,et,ru,ar}.jsonl`,
+`test.{ko,ja,cs,et,ru,ar}.jsonl`, `manifest.json`이다.
+Manifest에는 profile, 전체 recipe 목록, 선택한 corpus 목록, 입력 hash, seed,
+분할별 개수 및 reference 수가 기록된다. 학습 pool 상한은 없다.
+
+평가 입력은 `wmt-conference/wmt25-general-mt` revision
+`56c0a513f64ba63500e222b25bf87ac2201cb1eb`의 `data/wmt25-genmt.jsonl`에 고정한다.
+`--recipe_file` / `--eval_file`로 로컬 원본을 지정할 수도 있다.
+
+### 혼합 배치와 샘플별 프롬프트
+
+새 학습 설정은 `--wmt25_downstream_sampling proportional`이다.
+KO/JA/CS 전체 pool의 인덱스를 함께 셔플하여 배치를 구성한다. 따라서 언어 비중은
+준비된 행 수에 비례하며, 매 배치에 세 언어가 모두 포함되거나 정확히 같은 비율로
+포함된다고 보장하지 않는다. MASSIVE의 전체 pool 비례 샘플링과 같은 규칙이다.
+
+각 인덱스로부터 언어와 원문·정답을 함께 가져온 뒤 다음 프롬프트를 렌더링한다.
+
+```text
+System: Translate the following sentences from English to Korean.
+User: I will meet you tomorrow.
+Assistant: 내일 만나요.
+```
+
+다음 샘플의 목표 언어가 일본어라면 그 샘플의 system 언어명은 Japanese가 된다.
+배치 전체에 하나의 언어명을 재사용하지 않는다. 각 행의 `tgt_lang`과 파일 언어를
+검증하고, system/user 토큰과 padding은 `-100`으로 마스킹한다.
+생성 평가에는 참조 번역을 프롬프트에 넣지 않는다.
+
+`language_balanced` 옵션은 기존 비교 실험 재현용이다. 이 경우 한 optimizer update의
+모든 microbatch가 하나의 목표 언어를 사용하고, 3 downstream update마다 각 언어를
+한 번씩 선택한다. 이전 checkpoint에 sampling 옵션이 없으면 기존 동작으로 해석한다.
+
+### 실행과 학습 예산
+
+두 WMT 스크립트는 다음 기본값을 전달한다.
+
+- `WMT25_DATA_DIR=data/wmt25_full_recipe_et_ru_ar_seed42`
+- `WMT25_CORPUS_PROFILE=full_recipe`
+- `WMT25_DOWNSTREAM_SAMPLING=proportional`
+
+요청한 profile과 manifest가 다르면 모델 로딩 전에 실패한다.
+Legacy TED 실험을 명시적으로 재현할 때만 `WMT25_CORPUS_PROFILE=ted`와
+해당 데이터 디렉터리를 함께 지정한다. 새 run 이름에는 corpus profile과 sampler가
+포함되며 `run_metadata.json`에도 실제 설정을 기록한다.
+
+```bash
+DRY_RUN=1 bash scripts/wmt25_transfer_only.sh transfer_only
+DRY_RUN=1 bash scripts/wmt25_contrastive_only.sh alternative
+
+bash scripts/wmt25_transfer_only.sh transfer_only
+ALIGNMENT_LOSS=centered_infonce bash scripts/wmt25_contrastive_only.sh alternative
+ALIGNMENT_LOSS=centered_infonce bash scripts/wmt25_transfer_only.sh contrastive_then_transfer
+```
+
+인자가 없으면 transfer 스크립트는 `transfer_only`와 `contrastive_then_transfer`,
+contrastive 스크립트는 `contrastive_only`와 `alternative`를 실행한다.
+
+| Mode | Alignment updates | MT updates | Total updates |
+|---|---:|---:|---:|
+| contrastive_only | 50,000 | 0 | 50,000 |
+| transfer_only | 0 | 50,000 | 50,000 |
+| alternative | 50,000 | 50,000 | 100,000 |
+| contrastive_then_transfer | 50,000 | 50,000 | 100,000 |
+
+데이터 교체가 step budget을 늘리지는 않는다. Batch 16, accumulation 1, 단일 GPU에서
+50,000 MT updates는 800,000개 샘플 노출이다. 전체 recipe를 후보 pool로 사용한다는
+뜻이며, 이 예산으로 모든 행을 한 번 이상 학습한다는 뜻은 아니다.
+언어 혼합 여부도 처리 토큰 수나 FLOPs의 동일성을 보장하지 않는다.
+Alignment의 `same_pair` 배치와 InfoNCE negative 구성은 그대로다.
+
+### 평가
+
+`scripts/wmt25_eval.sh`는 `results_wmt25`의 checkpoint를 대상으로
+`alignment wmt25`, chrF, 생성 batch 1, 최대 신규 토큰 16384를 기본 사용한다.
+
+```bash
+bash scripts/wmt25_eval.sh --dry-run MODEL_FOLDER/RUN_NAME
+bash scripts/wmt25_eval.sh MODEL_FOLDER/RUN_NAME
+
+python evaluate.py --checkpoint_path CHECKPOINT \
+  --tasks wmt25 --split test --language_scope both \
+  --wmt25_batch_size 1 --wmt25_max_new_tokens 16384 --wmt25_metric chrf
+```
+
+`evaluate.py`를 직접 사용할 때 metric 기본값은 여전히 `none`이므로
+점수가 필요하면 `--wmt25_metric chrf`를 지정한다. ET/RU/AR를 포함한 현재 평가
+언어는 공식 `refA`를 사용한다. 시스템 출력을 reference로 대체하지 않는다.
+입력은 자르지 않으며 context 초과, 출력 길이 제한 도달, 문단 수 불일치를 확인한다.
+학습 중 downstream loss 평가와 생성 번역의 chrF 평가는 별도다.
+
+`scripts/select_checkpoint.py RUN_DIR --rule wmt25_in`은 seen validation loss로
+checkpoint를 선택한다. 분할 정의, 학습 corpus hash, sampling, checkpoint 선택 규칙을
+논문과 함께 기록한다.
+
+검증은 `test_prepare_wmt25.py`, `test_wmt25_dataset.py`,
+`test_pair_batching.py`에서 recipe 전체 선택, 분할 간 원문 배제, profile 오류,
+혼합 배치의 행별 언어 프롬프트/정답/masking, 학습 스케줄 재현을 검사한다.
+작은 CPU fixture 검증은 전체 corpus 다운로드 및 실제 GPU 학습 검증과 별도다.
+
+### Legacy WMT23 recipe profile (EN → DE/HE/JA)
+
+이전 recipe 실험의 profile은 `accessible_parallel`이다. 이 profile의 논문 표기는
+**“accessible subsets of the WMT23 parallel-training recipes”**라고 명시한다.
+DE/JA는 지정 recipe의 모든 병렬 source를 사용하고, HE에서는 다음 두 source만 제외한다.
+
+- `Neulab-tedtalks_train-1-eng-heb`: 기존 URL이 아카이브 대신 HTML을 반환.
+- `ELRC-wikipedia_health-1-eng-heb`: direct ELRC 서버 인증서 만료.
+
+나머지 OPUS ELRC source는 유지하지만 direct ELRC와 동일 파일이라고 가정하지 않는다.
+이외의 다운로드 실패는 자동 제외하지 않고 오류로 처리한다. Source 수는 DE 13, HE 20,
+JA 7이며, source별 원래 ID·실제 ID·제외 사유와 파일 SHA256을 manifest에 기록한다.
+기존 News Commentary v16 → v18.1 변경도 manifest에 명시한다.
+
+각 언어의 모든 유효 병렬 행을 merge한 뒤, 양쪽 문자열의 앞뒤 공백만 제거한
+`(English source, target)` 쌍이 완전히 같은 중복을 제거한다. 같은 원문에 서로 다른
+번역이 붙은 행은 유지한다. Corpus ID 순으로 처음 나온 행의 ID를 유지하며,
+JSON으로 이스케이프한 source/target의 `LC_ALL=C` 정렬 순서를 고정한다.
+대규모 중복 제거에는 메모리 제한이 있는 외부 sort를 사용한다. 그 후 seed 42로
+학습 언어별 validation 500개를 추출하고, validation/test 영어 원문과 정확히 겹치는
+행을 학습에서 제외한다. 공식 WMT23 test에는 dedupe나 도메인 필터를 적용하지 않는다.
+
+WMT SFT와 OPUS-100 alignment의 학습 언어는 모두 **DE/HE/JA**다.
+**ZH/RU/UK의 WMT train 및 OPUS-100 train은 adaptation에 사용하지 않는다.**
+OPUS의 이 세 언어 validation/test는 평가 전용이며, checkpoint 선택에는
+seen-language `wmt23_in`만 사용한다. OPUS train은 고정 revision의 로컬 파일에서
+평가 원문을 제외한 뒤 언어쌍마다 10,000개를 추출한다.
+
+```bash
+python scripts/prepare_wmt23.py \
+  --output_dir data/wmt23_accessible_parallel \
+  --mtdata_dir data/raw/wmt23_accessible \
+  --corpus_profile accessible_parallel --seed 42 --validation_per_language 500
+
+export WMT23_MANIFEST_SHA256=PREPARATION_OUTPUT_HASH
+ALIGNMENT_LOSS=centered_infonce MODEL_NAME=meta-llama/Llama-3.2-1B-Instruct \
+  CUDA_VISIBLE_DEVICES=0 bash scripts/wmt23_contrastive_only.sh alternative
+```
+
+`WMT23_DATA_DIR`로 준비 디렉터리를 지정할 수 있다. Manifest와 모든 학습·평가 파일의
+해시 검증이 끝나야 모델 학습이 시작된다. Downstream은 dedupe 후 전체 DE/HE/JA pool을
+비례 셔플하며, 혼합 배치에서도 각 행의 언어 프롬프트를 사용한다. 언어별 동일 노출량을
+강제하지 않는다. Alternating은 alignment 50,000 + SFT 50,000 update이며,
+동일한 pool·seed·batch 설정이면 contrastive-then-SFT와 objective별 샘플 순서가 같다.
+
+### Current MT profile: ALMA + Japanese, OPUS alignment
+
+현재 두 WMT23 학습 스크립트의 기본 profile은 `alma_ja_opus`이다.
+학습 언어는 **de/cs/ja**, 미학습 평가 언어는 **zh/ru/uk**, anchor는 English다.
+Mid-Align의 데이터 수집 방식을 따르되, 일본어 추가와 별도의 OPUS 정렬은 명시적인
+차이이므로 원논문의 데이터 설정을 완전히 재현했다고 표기하지 않는다.
+
+| 용도 | 데이터 |
+|---|---|
+| DE/CS SFT | `haoranxu/ALMA-Human-Parallel` 원본 train 전체: 14,211 / 12,076쌍 |
+| JA SFT | WMT20 en-ja 1,000 + ja-en 993쌍, FLORES-200 dev 997 + devtest 1,012쌍 |
+| SFT validation | DE/CS는 ALMA validation 각 1,002쌍; JA는 WMT21 en-ja 1,000쌍 |
+| 번역 test | `haoranxu/WMT23-Test` 양방향 전체; cs-en은 저자 코드처럼 en-cs를 역방향 사용 |
+| Alignment | OPUS-100 seen-language train에서 held-out 영어 원문을 제외한 뒤 언어쌍별 10,000개 |
+
+SFT는 모든 병렬 쌍을 양방향으로 사용하여 **60,578개** 예제를 만든다. 원본 문자열과
+행 순서를 보존하며 샘플 수 제한·도메인 필터·Unicode 정규화를 적용하지 않는다.
+현재 `balanced_mixed` sampler는 **DE/CS/JA의 학습 노출 수를 균등하게** 정한다.
+각 언어의 전체 양방향 pool을 셔플·순환하므로 적은 언어는 더 자주 반복하고,
+어느 언어의 원본 데이터도 줄이지 않는다. 언어별 quota를 정한 뒤 전체 순서를
+셔플하므로 배치마다 언어 개수를 강제하지 않는다. 각 행의 **출발/도착 언어**로 prompt를 만든다.
+과거 비례 샘플링 실행은 `proportional`로 구분해 보존한다.
+평가도 방향별로 분리하고 BLEU tokenizer는 도착 언어를 기준으로 선택한다.
+HF WMT23-Test의 참조 번역을 그대로 사용하며 공식 저장소의 다른 ref로 바꾸지 않는다.
+
+ALMA 원본처럼 JA의 WMT 수집 기간도 2017–2020으로 제한한다. 이 기간의 JA 자료는
+WMT20에만 있다. JA validation은 WMT21, 최종 test는 WMT23으로 분리한다.
+FLORES의 id와 URL을 확인하여 영어와 일본어를 대응시킨다. SFT 학습과 held-out 데이터의
+동일 언어·동일 병렬 쌍 중복이 있으면 자동 삭제하지 않고 준비 단계에서 실패한다.
+OPUS의 zh/ru/uk **train은 다운로드하지 않으며 adaptation에도 사용하지 않는다**.
+그 언어들의 OPUS validation/test는 진단 전용이며 checkpoint 선택에 사용하지 않는다.
+
+모델·정렬 층·pooling·loss·LoRA 설정과 기존 update 예산은 유지한다. Alternating과
+contrastive-then-SFT 모두 alignment 50,000 + SFT 50,000 update이며 batch 16,
+accumulation 1에서는 SFT 예제 노출이 800,000회이다. 현재 작은 SFT pool에서는
+언어별 266,666 또는 266,667회이며, 800,000이 3으로 나누어떨어지지 않아
+최대 1개 차이가 난다. 정렬/SFT의 RNG를 분리하여 alternating과 CTT가 각 objective에서
+같은 순서를 사용한다. 언어마다 pool 크기가 달라 반복 횟수는 다르며,
+이는 원논문의 최대 5 task epoch와 다른 학습 예산이다.
+
+```bash
+python scripts/prepare_wmt23.py \
+  --output_dir data/wmt23_alma_ja_opus --corpus_profile alma_ja_opus --seed 42
+
+export WMT23_MANIFEST_SHA256=PREPARATION_OUTPUT_HASH
+ALIGNMENT_LOSS=centered_infonce MODEL_NAME=meta-llama/Llama-3.2-1B-Instruct \
+  CUDA_VISIBLE_DEVICES=0 bash scripts/wmt23_contrastive_only.sh alternative
+```
+
+각 원본 HF revision, WMT 아카이브 MD5, 추출 파일 SHA256, 준비 코드 hash와 최종 Arrow
+체크섬을 manifest에 기록한다. 다음 실험에서는 이 로컬 저장본과 같은 manifest hash를
+재사용한다. 과거 recipe 다운로드 파일은 이 profile의 학습에 필요하지 않다.
+
+정렬 forward는 모든 token의 hidden state를 유지하면서 `logits_to_keep=1`로 사용하지
+않는 전체 어휘 logits 할당을 줄인다. 표현·정렬 loss·gradient의 동일성을 검사하며,
+배치 크기, 정렬 층과 pooling 설정은 바꾸지 않는다. Qwen3.5의 WMT SFT에서는
+`--downstream_micro_batch_size 8`로 16개 예제를 8개씩 두 번 forward/backward하고
+optimizer는 한 번만 update한다. 각 microbatch의 HF 기본 CE에
+`해당 microbatch 정답 token 수 / 16개 전체 정답 token 수`를 곱하여 누적한다.
+별도의 vocabulary CE chunk 구현은 사용하지 않는다. 정렬은 16개를 한 번에
+비교하므로 negative 개수와 centered loss의 중심 계산이 유지된다.
+전역 `batch_size=8, accumulative_steps=2`는 정렬 negative까지 줄이므로 사용하지 않는다.
+Llama는 16개를 한 번에 처리한다. microbatch 분할은 dropout의 실제 난수 배치를
+바꿀 수 있으며, 동일한 seed가 다른 계산 방식 사이의 bitwise 동일성을 뜻하지 않는다.
+WMT 학습 스크립트는 `PYTORCH_ALLOC_CONF=expandable_segments:True`를 기본 적용하여
+길이가 다른 validation과 학습 배치 사이의 CUDA 메모리 단편화를 줄인다.
+
+`scripts/select_checkpoint.py RUN_DIR`의 기본 선택 기준은 저장된 task의 seen validation
+(`wmt23_in`)이며, contrastive-only에서는 `align_in`이다. 초기 step 0과 저장되지 않은
+검증 step은 후보에서 제외한다. 현재 save/eval 간격 1000/2500에서는 5000의 배수만
+두 조건을 만족한다. 총 학습량을 고정하여 비교할 때는 `--rule final_step`을 사용한다.
+WMT 평가 실행은 `scripts/wmt23_eval.sh RUN_DIR`을 사용한다. 기존 자동 평가 큐
+`scripts/evaluation_queue.py`는 MASSIVE용 설정이므로 WMT run을 그 큐에 넣지 않는다.
+일본어 SacreBLEU는 `requirements.txt`의 `sacrebleu[ja]` 의존성이 필요하다.
+
+### Mid-Align과 같은 COMET-22 채점
+
+[저자 평가 코드](https://github.com/dannigt/mid-align/blob/master/scripts/run_inference_eval_wmt23.py)는
+HF `evaluate.load("comet")`에 원문·생성 번역·정답 번역을 전달한다.
+[HF 구현](https://github.com/huggingface/evaluate/blob/main/metrics/comet/comet.py)의
+`unbabel-comet >= 2` 기본 모델인 **`Unbabel/wmt22-comet-da`**를 직접 호출한다.
+COMETKiwi가 아닌 reference-based 모델이다. Revision
+`2760a223ac957f30acfb18c8aa649b01cf1d75f2`와 checkpoint/hparams SHA256을 검증한다.
+저자가 실행했던 패키지 전체 버전은 확인되지 않아 bitwise 재현을 뜻하지는 않는다.
+
+COMET은 Transformers 4 / NumPy 1을 요구하므로 학습 환경과 분리한다.
+별도의 채점 환경은 다음과 같이 설치한다.
+
+```bash
+python -m venv .venv-comet22
+# CPU 전용일 때 먼저 설치. CUDA 채점 환경을 만들 때는 이 줄을 생략한다.
+.venv-comet22/bin/python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
+.venv-comet22/bin/python -m pip install -r requirements-comet22.txt
+```
+
+이미 저장한 번역을 재생성 없이 채점한다. `in`/`out` 각각 실행하며, 한 디렉터리에는
+같은 run·split·scope의 prediction 파일만 둔다. 첫 실행은 약 2.3 GB의 COMET
+checkpoint와 XLM-R tokenizer/config를 다운로드한다.
+
+```bash
+.venv-comet22/bin/python scripts/score_comet22.py \
+  --prediction_dir CHECKPOINT/evaluations/test/in --gpus 0 --batch_size 16
+.venv-comet22/bin/python scripts/score_comet22.py \
+  --prediction_dir CHECKPOINT/evaluations/test/out --gpus 0 --batch_size 16
+
+# 번역 생성 + 기존 BLEU + 추가 COMET. LLM 프로세스 종료 후 COMET을 실행한다.
+EVAL_COMET22=true bash scripts/wmt23_eval.sh MODEL_FOLDER/RUN_NAME
+
+# 별도의 CUDA 지원 COMET 환경이 있을 때:
+EVAL_COMET22=true COMET22_PYTHON=/path/to/comet-env/bin/python \
+  COMET22_GPUS=1 bash scripts/wmt23_eval.sh MODEL_FOLDER/RUN_NAME
+```
+
+`EVAL_WMT23_METRIC=comet22`도 지원한다. 이 경우 생성은 metric `none`으로 수행하고
+이후 COMET만 채점한다. `COMET22_BATCH_SIZE` 기본값은 저자 HF wrapper가 호출하는
+COMET의 기본 batch size인 16이며 `COMET22_GPUS`는 0(CPU)이다.
+`evaluate.py` 직접 호출도 `--wmt23_metric comet22 --comet22_python ...`로 가능하다.
+이 경로에서는 LLM이 메모리에 남으므로 기본 CPU 채점을 사용하거나 위의 분리 실행을
+사용한다. `--checkpoint`/`COMET22_CHECKPOINT`는 동일 공식 checkpoint의 로컬 복사본만
+허용하며 `checkpoints/model.ckpt` 및 상위 디렉터리의 `hparams.yaml` 구조가 필요하다.
+
+출력은 각 scope의 `wmt23_comet22_metrics.json`과 `wmt23_comet22_scores.jsonl`이다.
+기존 `wmt23_metrics.json`의 BLEU 결과는 유지한다. 원문은 번역 방향 그대로
+`src`, 생성문은 `mt`, 정답은 `ref`로 전달하며 추가 정규화·strip·문장 분할을 하지 않는다.
+빈 생성문도 점수에 포함하고, 누락된 정답·중복 sample ID·비정상 점수는 오류로 처리한다.
+문장별 결과는 입력 파일/행 순서를 보존한다. 저장된 생성문은 `evaluate.py`의 기존
+생성 후처리가 적용된 값이며, 원논문과 생성 길이·prompt 등의 차이는 별도로 남아 있다.
+
+- `comet22`, `mean_score`: 원래 모델 점수. `*_x100`은 논문 표처럼 100배 표시한 값.
+- `by_language`: `en-de`, `de-en` 등 방향별 문장 평균.
+- `macro_average`: 방향별 점수의 산술평균. 전체 문장 평균 `mean_score`와 구별한다.
+- `macro_by_translation_direction`: `en_to_x`와 `x_to_en`을 분리한 방향별 macro 평균.
+- 모델 revision, weights/hparams hash, 실제 패키지 버전, prediction 파일 hash를 기록한다.
+
+COMET 채점기를 맞추어도 전체 MT 실험이 같아지는 것은 아니다. 현재 OPUS 정렬 corpus,
+언어 균등 반복 sampler/seed, 학습 update 수, batch/optimizer/LoRA/양자화 설정과
+모델·정렬 층·pooling 차이는 유지된다. 동일한 실험 설정 안에서 방법 간 비교에 사용한다.
+
+### WMT 학습·평가 큐
+
+2026-10-05 최신 요청에 따라 후순위 학습을 중단하고 BLEU·COMET 평가를 우선 실행한다.
+`scripts/wmt23_pipeline.py`의 평가 전용 모드는 새 학습을 시작하지 않는다.
+
+1. GPU 0: 완료된 모델부터 즉시 BLEU·COMET 평가. 진행 중이던 후순위 학습과 나머지
+   후순위 큐는 중단했으며 자동 재시작하지 않는다.
+2. GPU 1: 실행 중인 우선순위 Qwen InfoNCE alternative를 마친 뒤 남은 평가에 합류한다.
+   두 GPU는 같은 큐에서 준비된 모델을 하나씩 가져가 중복 없이 평가한다.
+   우선순위는 모델별 InfoNCE contrastive-only / transfer-only / contrastive-then-transfer /
+   alternative와 centered InfoNCE alternative다. 각 최종 adapter로 seen/unseen 언어 양방향의
+   WMT23 test 21,067개 예제에 BLEU와 COMET-22를 계산한다. 생성 batch 1, 신규 토큰 제한
+   16,384를 유지하고, 생성 프로세스 종료 후 COMET GPU batch 16으로 채점한다.
+
+현재 평가 계획과 상태는 `logs/wmt23_bleu_comet_20261005/`에 저장한다.
+완료된 학습은 config·최종 step·완료 metadata·adapter를 검증해 재사용한다.
+실행 중인 학습을 인계할 때 PID와 시작 시각을 함께 확인한다. 실행 전에 학습 명령이
+저장된 계획과 같은지 검사한다. 평가 실패는 상태와 로그에 기록하고 이후 평가를 차단한다.
+재실행 시 완료된 생성/COMET 결과는 예제 수와 prediction hash 검증 후 재사용한다.
+
+```bash
+python scripts/wmt23_pipeline.py \
+  --manifest logs/wmt23_bleu_comet_20261005/manifest.json \
+  --state_dir logs/wmt23_bleu_comet_20261005 --dry-run
+
+# 각 큐의 상태/로그: state.json / controller.log
+# 평가 결과: RUN/evaluations/priority_mt_20261004/test/{in,out}/
+
+# 평가가 끝날 때 자동 집계하며, 아래 명령으로 수동 갱신할 수도 있다.
+python scripts/summarize_wmt23.py \
+  --manifest logs/wmt23_split_20261005/previous_pipeline/manifest.json \
+  --state_dirs logs/wmt23_split_20261005/gpu0_later logs/wmt23_bleu_comet_20261005 \
+  --output_dir reports/wmt23_20261005
+```
+
+큐의 중복 실행은 controller lock으로 막고, GPU별 기존 학습 lock도 공유한다.
+이 큐는 GPU를 지원하는 COMET 환경을 manifest의 `comet_python`으로 지정해야 한다.
+`summary.md`와 `summary.csv`에는 BLEU·COMET만 기록한다. 학습 중 validation loss는
+별도 `validation.md` / `validation.csv`에 보관한다.
+`test_wmt23_pipeline.py`는 단계 전환, 평가 전용 모드의 학습 차단, GPU 간 중복 없는
+작업 배정, 완료 판정 및 오래된 prediction/COMET 결과의 재사용 방지를 검사한다.

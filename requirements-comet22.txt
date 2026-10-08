@@ -1,0 +1,8 @@
+# Separate environment: the MT training environment uses transformers 5 / numpy 2.
+# torch < 2.6 also preserves Lightning's loading of this official COMET checkpoint.
+unbabel-comet==2.2.7
+torch==2.5.1
+transformers==4.44.2
+pytorch-lightning==2.4.0
+numpy==1.26.4
+setuptools==80.9.0

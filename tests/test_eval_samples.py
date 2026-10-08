@@ -17,6 +17,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 from custom_trainer import AlternativeRoutingTrainer
 from alignment_logging import AlignmentStatistics
 from data_utils import make_sample_id
+import evaluate as evaluation
 from evaluate import (
     EvalSampleRecorder,
     build_massive_evaluation_samples,
@@ -115,6 +116,40 @@ class NumericMassive:
 
 
 class EvalSampleTests(unittest.TestCase):
+    def test_main_can_restrict_retrieval_to_in_while_retaining_both_downstream_scopes(self):
+        for alignment_scope in (None, "in"):
+            with self.subTest(alignment_scope=alignment_scope), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                argv = ["evaluate.py", "--checkpoint_path", tmp, "--split", "test", "--language_scope", "both",
+                        "--tasks", "alignment", "massive", "--output_dir", str(root / "eval"), "--eval_sample_log_limit", "0"]
+                if alignment_scope is not None:
+                    argv.extend(["--alignment_language_scope", alignment_scope])
+                config = SimpleNamespace(downstream_task="massive", alignment_loss="gap_distance_infonce")
+                with patch("sys.argv", argv), patch.object(evaluation, "load_experiment_config", return_value=config), \
+                        patch.object(evaluation, "build_model", return_value=(None, None)), \
+                        patch.object(evaluation, "wmt_generation_eos_ids", return_value=[2]), \
+                        patch.object(evaluation, "evaluate_alignment_scope", return_value={"retrieval": "fixture"}) as retrieval, \
+                        patch.object(evaluation, "evaluate_massive_scope", return_value={"slots": "fixture"}) as massive, \
+                        redirect_stdout(io.StringIO()):
+                    evaluation.main()
+                expected = ["in"] if alignment_scope == "in" else ["in", "out"]
+                self.assertEqual([call.kwargs["scope"] for call in retrieval.call_args_list], expected)
+                self.assertEqual([call.kwargs["scope"] for call in massive.call_args_list], ["in", "out"])
+                meta = json.loads((root / "eval/test/evaluation_metadata.json").read_text())
+                self.assertEqual(meta["status"], "completed")
+                self.assertEqual(meta["language_scopes"], ["in", "out"])
+                self.assertEqual(meta["alignment_language_scopes"], expected)
+                self.assertEqual("alignment" in meta["results"]["out"], "out" in expected)
+                self.assertIn("massive", meta["results"]["out"])
+
+    def test_retrieval_scope_outside_overall_scopes_fails_before_model_load(self):
+        argv = ["evaluate.py", "--checkpoint_path", "unused", "--language_scope", "in",
+                "--alignment_language_scope", "both"]
+        with patch("sys.argv", argv), patch.object(evaluation, "build_model") as build:
+            with self.assertRaisesRegex(ValueError, "contained"):
+                evaluation.main()
+        build.assert_not_called()
+
     @classmethod
     def setUpClass(cls):
         cls.old_threads = torch.get_num_threads()
