@@ -235,10 +235,20 @@ class CustomModel(nn.Module):
                 )
             else:
                 gaps = target.unsqueeze(0) - source.unsqueeze(1)
-                if loss_type == "gap_distance_infonce":
+                if loss_type in {"gap_distance_infonce", "gap_distance_rms", "gap_distance_detach"}:
                     distances = gaps.norm(dim=-1)
                     mean_distance = distances.diagonal().mean()
                     scale = getattr(config, "alignment_gap_scale", 1.0)
+                    if loss_type == "gap_distance_detach":
+                        # Recompute the batch reference each forward, but omit
+                        # its indirect gradient through the positive pairs.
+                        mean_distance = mean_distance.detach()
+                    elif loss_type == "gap_distance_rms":
+                        # Keep BOTH reference and RMS live so uniform distance
+                        # scaling cancels in backward as well as forward.
+                        # Clamp before sqrt for finite gradients at collapse.
+                        batch_rms = distances.square().mean().clamp_min(1e-12).sqrt()
+                        scale = scale * batch_rms
                     scores = -((distances - mean_distance) / scale).square()
                 elif loss_type == "gap_direction_infonce":
                     mean_gap = (target - source).mean(dim=0)

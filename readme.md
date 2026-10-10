@@ -1,6 +1,6 @@
 # 2026 October ARR: Cross-lingual Representation Alignment
 
-구현 대조 기준: **2026-09-28**. 현재 alignment 목적함수는 5가지이며,
+구현 대조 기준: **2026-10-10**. alignment 목적함수는 기존 5가지와 Gap Distance 변형 2가지이며,
 학습 스케줄(`training_type`) 4가지와 별도로 선택한다.
 옵션의 기준은 [config.py](config.py), 수식의 기준은 [models.py](models.py)다.
 실험별 실제 설정은 해당 run의 `experiment_config.json`을 확인한다.
@@ -35,6 +35,76 @@ python -m pip install -r requirements.txt
 학습 의존성은 2026-10-08 실행 환경의 핵심 버전으로 고정했다.
 Qwen3.5 학습 환경과 COMET 환경은 분리한다. 학습 환경의 torch를 COMET용
 2.5.1로 낮추지 않는다. 새 서버의 CUDA/드라이버 호환성은 아래 preflight로 확인한다.
+
+## 새 Gap 변형: 다른 서버에서 MASSIVE 실행 (2026-10-10)
+
+`gap_distance_detach`는 정답쌍 평균 거리의 gradient만 차단한다.
+`gap_distance_rms`는 전체 후보 거리의 RMS로 거리 편차를 나누며,
+평균 거리와 RMS 모두 gradient를 유지한다. RMS의 수치 하한은 1e-6이다.
+두 방법 모두 `--alignment_loss`로 선택하며 `same_pair` 배치를 사용한다.
+
+전용 실행기는 **Llama detach → RMS**, **Qwen RMS**를 기본 순서로 실행한다.
+각 실험은 MASSIVE `alternative`, 최종층 `-1`, seed 42, BF16/4-bit,
+batch 16, learning rate 1e-4, LoRA r=16/alpha=32, 100,000 optimizer updates
+(50,000 alignment + 50,000 SFT)다. 검증은 In 언어에서 2,500 step마다,
+checkpoint는 1,000 step마다 저장한다. 각 학습 후 In retrieval와
+In/Out Slot F1·EM 평가를 완료한 다음 실험으로 넘어간다.
+
+이 실행에는 **준비된 MT/ALMA 파일이나 COMET 환경이 필요하지 않다.**
+MASSIVE·OPUS·모델 가중치는 Hugging Face 캐시가 없으면 내려받는다.
+Llama 저장소 접근 권한이 있는 계정과 CUDA/BF16 지원 GPU가 필요하다.
+실행기를 호출한 Python을 학습·평가에도 사용한다.
+
+처음 받는 서버에서는 다음과 같이 준비한다. 이미 clone한 경우에는 저장소에서
+`git pull --ff-only origin main`을 실행하고 기존 환경을 활성화한다.
+
+```bash
+git clone https://github.com/SoeonPark/26_Oct_ARR.git
+cd 26_Oct_ARR
+conda create -n octarr python=3.11 -y
+conda activate octarr
+python -m pip install -r requirements.txt
+hf auth login
+```
+
+설정을 먼저 출력하고 실행 환경을 검사할 수 있다. `--dry-run`은 학습·GPU 사용·
+상태 파일 생성을 하지 않는다. `--check-only`는 모델 가중치를 로드하지 않는다.
+
+```bash
+python scripts/run_massive_gap_variants.py --model llama --gpu 0 --dry-run
+python scripts/run_massive_gap_variants.py --model llama --gpu 0 --check-only
+python scripts/run_massive_gap_variants.py --model qwen --gpu 1 --check-only
+```
+
+비어 있는 GPU 두 장에서 각각 실행한다. GPU가 한 장이면 두 명령을 순차 실행한다.
+
+```bash
+mkdir -p logs
+nohup python -u scripts/run_massive_gap_variants.py --model llama --gpu 0 \
+  > logs/massive_gap_llama.log 2>&1 &
+nohup python -u scripts/run_massive_gap_variants.py --model qwen --gpu 1 \
+  > logs/massive_gap_qwen.log 2>&1 &
+```
+
+단일 변형은 `--loss detach` 또는 `--loss rms`, 두 변형은 `--loss both`로
+선택한다. W&B는 기본 disabled이며 `--wandb-mode online`으로 켤 수 있다.
+`--state-dir`로 큐 기록 위치를 지정할 수 있다. 새 서버의 실행기는 현재 서버에서
+동작하는 프로세스나 로컬 대기 큐를 가져오지 않는다. 완료된 adapter와 평가 결과는
+검증 후 재사용하고, 미완료 학습을 발견하면 자동으로 덮어쓰지 않는다.
+
+학습 중 진단 그래프가 필요하면 선택적으로 Matplotlib을 설치한다.
+아래 CPU 모니터는 기존 validation 임베딩을 읽으며 추가 모델 추론을 하지 않는다.
+각 실행기의 출력에 표시된 state directory를 전달한다.
+
+```bash
+python -m pip install matplotlib==3.10.6
+python scripts/monitor_gap_variants.py --watch \
+  --state-dir /path/to/queue-state --output-dir /path/to/monitor-output
+```
+
+기존 Gap 결과를 복사했다면 `--baseline /path/to/original-gap-run`을 추가할 수 있다.
+모니터는 원래 B16 배치를 유지해 거리 RMS·정규화 점수 차이·배치 정답률·축소 방향
+미분·MASSIVE 검증 loss를 비교한다. 이 배치 정답률은 전체 후보 retrieval가 아니다.
 
 ## 다른 서버에서 세 실험 순차 실행 (2026-10-08)
 
@@ -1059,7 +1129,7 @@ task·언어별 샘플 64개 저장이다. 스크립트 상단에서 설정을 �
 
 `massive_transfer_only.sh transfer_only`로 task-only 모드를 지정할 수 있다.
 스크립트 파일명과 달리 인자 없는 기본 실행은 현재 `contrastive_then_transfer`다.
-`ALIGNMENT_LOSS`는 다섯 옵션 중 하나로 제한할 때 쓴다.
+`ALIGNMENT_LOSS`는 7가지 옵션 중 하나로 제한할 때 쓴다.
 InfoNCE-Alt는 `ALIGNMENT_LOSS=infonce`와 `alternative` 모드를 지정한다.
 다음은 학습 없이 실제 실행 명령만 확인하는 예시다.
 
@@ -1093,9 +1163,9 @@ python main.py \
 
 CLI 기본값은 기존 실험 호환을 위해 `infonce`다. 학습 스크립트는
 `ALIGNMENT_LOSS=gap_consistency bash scripts/massive_contrastive_only.sh`처럼
-선택하며 run name에 손실 종류를 포함한다. 위 Python 명령의 loss를 ①~⑤ 중
-하나로 바꾸면 된다. **②만 temperature를 사용하지 않으며 ③④⑤는 사용한다.**
-`alignment_gap_scale`은 ③에만 적용한다. 현재 SH에는 scale 전용 환경변수가
+선택하며 run name에 손실 종류를 포함한다. 위 Python 명령의 loss를 ①~⑤ 또는
+`gap_distance_detach`, `gap_distance_rms`로 바꾸면 된다. **②만 temperature를 사용하지 않으며 ③④⑤는 사용한다.**
+`alignment_gap_scale`은 ③ 및 두 Gap Distance 변형에 적용한다. 현재 SH에는 scale 전용 환경변수가
 없으므로 scale을 바꾸는 실험은 Python CLI에서 지정한다.
 `transfer_only`는 선택한 alignment 손실로 학습하지 않고, 검증에서만
 사용한다. 독립 평가는 checkpoint 설정을 읽는다. 필드가 없는 이전

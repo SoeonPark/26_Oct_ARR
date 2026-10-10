@@ -99,7 +99,7 @@ if [[ ! -x "${python_bin}" ]]; then
 fi
 for alignment_loss in "${alignment_losses[@]}"; do
     case "${alignment_loss}" in
-        infonce|gap_consistency|gap_distance_infonce|centered_infonce|gap_direction_infonce) ;;
+        infonce|gap_consistency|gap_distance_infonce|gap_distance_rms|gap_distance_detach|centered_infonce|gap_direction_infonce) ;;
         *) printf 'Unknown alignment loss: %s\n' "${alignment_loss}" >&2; exit 2 ;;
     esac
     if [[ "${alignment_loss}" != "infonce" && "${alignment_batching}" != "same_pair" ]]; then

@@ -248,13 +248,16 @@ class ContrastiveVariantTests(unittest.TestCase):
                 output = model(alignment=alignment_batch(), return_per_sample=True)
                 a, b = output["source_embeddings"], output["target_embeddings"]
                 mean_distance = torch.stack([(y-x).norm() for x, y in zip(a, b)]).mean()
+                rms_distance = torch.stack([(y-x).square().sum() for x in a for y in b]).mean().sqrt()
                 mean_gap = b.mean(0) - a.mean(0)
                 rows = []
                 for x in a:
                     row = []
                     for y in b:
-                        if method == "gap_distance_infonce":
+                        if method in ("gap_distance_infonce", "gap_distance_detach"):
                             score = -(((y-x).norm()-mean_distance)/2.5).square()
+                        elif method == "gap_distance_rms":
+                            score = -(((y-x).norm()-mean_distance)/(2.5*rms_distance)).square()
                         elif method == "centered_infonce":
                             score = F.cosine_similarity(x-a.mean(0), y-b.mean(0), dim=0)
                         else:
@@ -277,7 +280,10 @@ class ContrastiveVariantTests(unittest.TestCase):
                 a = torch.randn(3, 4, generator=generator, dtype=torch.float64, requires_grad=True)
                 b = torch.randn(3, 4, generator=generator, dtype=torch.float64, requires_grad=True)
                 fn = lambda x, y: model.compute_contrastive_variant_loss(x, y, ["en-ko"]*3)
-                self.assertTrue(torch.autograd.gradcheck(fn, (a, b)))
+                # Stop-gradient intentionally does not differentiate the entire
+                # forward function; its frozen-reference gradient is tested below.
+                if method != "gap_distance_detach":
+                    self.assertTrue(torch.autograd.gradcheck(fn, (a, b)))
                 for dtype in (torch.float16, torch.bfloat16):
                     x, y = a.detach().to(dtype), b.detach().to(dtype)
                     expected = fn(x.float(), y.float())
@@ -319,6 +325,121 @@ class ContrastiveVariantTests(unittest.TestCase):
                     make_model(method).compute_contrastive_variant_loss(
                         torch.ones(2, 3), torch.ones(2, 3), ["en-ko", "en-ja"],
                     )
+
+
+class GapDistanceScaleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.old_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+
+    @classmethod
+    def tearDownClass(cls):
+        torch.set_num_threads(cls.old_threads)
+
+    def embeddings(self):
+        return (
+            torch.tensor([[1., 2.], [3., 5.], [-2., 1.]], dtype=torch.float64),
+            torch.tensor([[2., 6.], [7., 3.], [-1., -2.]], dtype=torch.float64),
+        )
+
+    def loss(self, method, source, target):
+        return make_model(method).compute_contrastive_variant_loss(
+            source, target, ["en-ko"] * len(source),
+        )
+
+    def test_detach_keeps_forward_value_but_removes_only_mean_gradient(self):
+        source, target = [h.requires_grad_() for h in self.embeddings()]
+        live_loss = self.loss("gap_distance_infonce", source, target)
+        detached_loss = self.loss("gap_distance_detach", source, target)
+        torch.testing.assert_close(detached_loss, live_loss)
+
+        distances = (source[:, None] - target[None, :]).norm(dim=-1)
+        radius = distances.diagonal().mean()
+        fixed_radius = radius.detach().requires_grad_()
+        logits = -(distances - fixed_radius).square() / .2
+        labels = torch.arange(len(source))
+        fixed_loss = (F.cross_entropy(logits, labels)
+                      + F.cross_entropy(logits.T, labels)) / 2
+        fixed_grad = torch.autograd.grad(
+            fixed_loss, (source, target, fixed_radius), retain_graph=True,
+        )
+        radius_grad = torch.autograd.grad(radius, (source, target))
+        live_grad = torch.autograd.grad(live_loss, (source, target))
+        detached_grad = torch.autograd.grad(detached_loss, (source, target))
+        self.assertGreater(abs(fixed_grad[2].item()), 1e-6)
+        for actual, live, frozen, radius_derivative in zip(
+                detached_grad, live_grad, fixed_grad[:2], radius_grad):
+            torch.testing.assert_close(actual, frozen)
+            torch.testing.assert_close(live - actual, fixed_grad[2] * radius_derivative)
+            self.assertGreater((live - actual).abs().max().item(), 1e-6)
+
+    def test_rms_loss_is_invariant_to_common_translation_and_centered_scaling(self):
+        source, target = self.embeddings()
+        center = torch.cat((source, target)).mean(dim=0)
+        expected = self.loss("gap_distance_rms", source, target)
+        for factor in (.02, .5, 2., 10.):
+            with self.subTest(factor=factor):
+                shifted_source = center + factor * (source - center) + 100.
+                shifted_target = center + factor * (target - center) + 100.
+                actual = self.loss("gap_distance_rms", shifted_source, shifted_target)
+                torch.testing.assert_close(actual, expected, atol=1e-11, rtol=1e-11)
+
+    def test_rms_radial_gradient_is_zero_with_live_normalizer_and_radius(self):
+        source, target = self.embeddings()
+        center = torch.cat((source, target)).mean(dim=0)
+        log_scale = torch.zeros((), dtype=torch.float64, requires_grad=True)
+        scaled_source = center + log_scale.exp() * (source - center)
+        scaled_target = center + log_scale.exp() * (target - center)
+        loss = self.loss("gap_distance_rms", scaled_source, scaled_target)
+        radial_gradient, = torch.autograd.grad(loss, log_scale)
+        torch.testing.assert_close(radial_gradient, torch.zeros_like(radial_gradient),
+                                   atol=1e-11, rtol=0.)
+
+    def test_zero_radius_and_collapsed_embeddings_have_finite_backward(self):
+        # Identical positive pairs can still be distinguishable across examples:
+        # the RMS denominator must include all candidates, not only positives.
+        cases = (
+            ([[0., 0.], [1., 0.], [0., 2.]], False),
+            ([[0., 0.], [0., 0.], [0., 0.]], True),
+            ([[4., -2.], [4., -2.], [4., -2.]], True),
+        )
+        for method in ("gap_distance_rms", "gap_distance_detach"):
+            for values, collapsed in cases:
+                with self.subTest(method=method, collapsed=collapsed, values=values):
+                    source = torch.tensor(values, dtype=torch.float64, requires_grad=True)
+                    target = source.detach().clone().requires_grad_()
+                    loss = self.loss(method, source, target)
+                    loss.backward()
+                    self.assertTrue(torch.isfinite(loss))
+                    self.assertTrue(torch.isfinite(source.grad).all())
+                    self.assertTrue(torch.isfinite(target.grad).all())
+                    if collapsed:
+                        torch.testing.assert_close(loss, torch.tensor(3., dtype=torch.float64).log())
+                    else:
+                        self.assertLess(loss.item(), torch.tensor(3.).log().item())
+
+    def test_distance_variants_reject_nonpositive_or_nonfinite_scale(self):
+        base = dict(training_type="contrastive_only", alignment_batching="same_pair",
+                    batch_size=2, eval_batch_size=2, alignment_temperature=.2)
+        for method in ("gap_distance_infonce", "gap_distance_rms", "gap_distance_detach"):
+            for scale in (0., -1., float("inf"), float("-inf"), float("nan")):
+                with self.subTest(method=method, scale=scale), self.assertRaises(ValueError):
+                    validate_gap_config(SimpleNamespace(
+                        **base, alignment_loss=method, alignment_gap_scale=scale,
+                    ))
+
+    def test_contrastive_variants_reject_nonpositive_or_nonfinite_temperature(self):
+        base = dict(training_type="contrastive_only", alignment_batching="same_pair",
+                    batch_size=2, eval_batch_size=2)
+        for method in ALIGNMENT_LOSSES:
+            if method == "gap_consistency":
+                continue
+            for temperature in (0., -1., float("inf"), float("-inf"), float("nan")):
+                with self.subTest(method=method, temperature=temperature), self.assertRaises(ValueError):
+                    validate_gap_config(SimpleNamespace(
+                        **base, alignment_loss=method, alignment_temperature=temperature,
+                    ))
 
 
 class GapConfigTests(unittest.TestCase):

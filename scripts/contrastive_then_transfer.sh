@@ -21,7 +21,7 @@ save_steps=500
 output_root="./results"
 alignment_loss="${ALIGNMENT_LOSS:-infonce}"
 alignment_batching="${ALIGNMENT_BATCHING:-mixed}"
-if [[ "${alignment_loss}" == gap_consistency ]]; then
+if [[ "${alignment_loss}" != infonce ]]; then
     alignment_batching="${ALIGNMENT_BATCHING:-same_pair}"
 fi
 train_sample_log_interval="${TRAIN_SAMPLE_LOG_INTERVAL:-1000}"

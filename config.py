@@ -1,4 +1,5 @@
 import argparse
+import math
 
 
 WMT23_ACCESSIBLE_EXCLUSIONS = {
@@ -16,12 +17,15 @@ WMT23_PARTITIONS = {
 ALIGNMENT_LOSSES = (
     "infonce", "gap_consistency", "gap_distance_infonce",
     "centered_infonce", "gap_direction_infonce",
+    "gap_distance_rms", "gap_distance_detach",
 )
 PAIR_BATCH_LOSSES = ALIGNMENT_LOSSES[1:]
 ALIGNMENT_REFERENCES = {
     "infonce": None,
     "gap_consistency": "microbatch_mean_distance",
     "gap_distance_infonce": "microbatch_mean_distance",
+    "gap_distance_rms": "microbatch_mean_distance_and_all_pair_rms",
+    "gap_distance_detach": "detached_microbatch_mean_distance",
     "centered_infonce": "microbatch_language_centroids",
     "gap_direction_infonce": "microbatch_mean_gap_vector",
 }
@@ -52,10 +56,14 @@ def validate_gap_config(args):
     ):
         if getattr(args, name, default) < 0:
             raise ValueError(f"{name} must be nonnegative.")
-    if loss_type != "gap_consistency" and not getattr(args, "alignment_temperature", 0.05) > 0:
-        raise ValueError("alignment_temperature must be positive.")
-    if loss_type == "gap_distance_infonce" and not getattr(args, "alignment_gap_scale", 1.0) > 0:
-        raise ValueError("alignment_gap_scale must be positive.")
+    if loss_type != "gap_consistency":
+        temperature = getattr(args, "alignment_temperature", 0.05)
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("alignment_temperature must be finite and positive.")
+    if loss_type in {"gap_distance_infonce", "gap_distance_rms", "gap_distance_detach"}:
+        scale = getattr(args, "alignment_gap_scale", 1.0)
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("alignment_gap_scale must be finite and positive.")
     if loss_type not in PAIR_BATCH_LOSSES:
         return
     if getattr(args, "eval_batch_size", 16) < 2:
@@ -119,7 +127,7 @@ def parse_args():
     parser.add_argument('--alignment_hidden_state_layer', type=int, default=-1, help='Layer of the model to use for alignment hidden states.')
     parser.add_argument('--alignment_hidden_state_position', type=str, default='last_token', help='Position of the hidden state to use for alignment.', choices=['last_token', 'mean']) 
     parser.add_argument("--alignment_temperature", type=float, default=0.05, help="Temperature for all InfoNCE variants; unused by gap_consistency.")
-    parser.add_argument("--alignment_gap_scale", type=float, default=1.0, help="Fixed distance scale for gap_distance_infonce: score = -((distance - positive_mean_distance) / scale)^2.")
+    parser.add_argument("--alignment_gap_scale", type=float, default=1.0, help="Positive fixed scale for gap_distance_infonce and gap_distance_detach; gap_distance_rms additionally divides by the live RMS of all pair distances.")
     parser.add_argument('--alignment_max_length', type=int, default=None, help='Maximum alignment sequence length. Falls back to tokenizer.model_max_length when omitted, which is the historical behaviour.')
 
     # Validation
