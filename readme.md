@@ -108,6 +108,57 @@ python scripts/monitor_gap_variants.py --watch \
 모니터는 원래 B16 배치를 유지해 거리 RMS·정규화 점수 차이·배치 정답률·축소 방향
 미분·MASSIVE 검증 loss를 비교한다. 이 배치 정답률은 전체 후보 retrieval가 아니다.
 
+## 새 Gap 변형: ALMA 학습부터 COMET까지 자동 실행
+
+`scripts/wmt23_gap_variants.sh`는 기존 큐의 학습·평가 코드를 사용하여
+**ALMA+JA SFT / OPUS alignment 학습 → 최종 adapter 검증 → OPUS In retrieval
+→ WMT23 In BLEU → COMET-22**를 자동 실행한다. GPU마다 자신의 학습이 끝나는
+즉시 평가하므로 다른 GPU의 학습 완료를 기다리지 않는다. 별도로 run 경로를
+찾거나 평가 명령을 실행할 필요가 없다.
+
+학습은 `alternative`, seed 42, 최종층 last-token, batch 16, BF16/NF4 LoRA,
+100,000 updates (alignment/SFT 각각 50,000)다. Retrieval은 In 3개 언어쌍,
+번역은 In 6개 방향을 평가하며 생성 batch 16 / 최대 신규 토큰 16,384를 유지한다.
+COMET은 번역 생성 프로세스 종료 후 같은 GPU에서 별도 환경으로 채점한다.
+
+준비는 기존 원격 실행과 같다. `octarr`에 `requirements.txt`, 별도
+`.venv-comet22`에 `requirements-comet22.txt`를 설치하고 Llama 접근 계정으로
+`hf auth login`한다. **COMET venv는 activate하지 않는다.**
+준비된 `data/wmt23_alma_ja_opus/` 전체를 기존 서버에서 `rsync -aL`로 복사한다.
+Git에는 데이터가 없으며, 기본 manifest SHA256은 아래 원격 실행 절의 값이다.
+
+```bash
+conda activate octarr
+export PYTHON_BIN="$(command -v python)"
+
+# 데이터 전체 checksum, 학습/COMET 환경 및 모델 config 접근 검사. 학습하지 않는다.
+bash scripts/wmt23_gap_variants.sh --model llama --loss detach --gpu 0 --check-only
+bash scripts/wmt23_gap_variants.sh --model llama --loss rms --gpu 1 --check-only
+
+# GPU 0: detach 학습 + 모든 최종 평가 / GPU 1: RMS 학습 + 모든 최종 평가
+mkdir -p logs
+nohup bash scripts/wmt23_gap_variants.sh --model llama --loss detach --gpu 0 \
+  > logs/alma_llama_detach.pipeline.log 2>&1 &
+nohup bash scripts/wmt23_gap_variants.sh --model llama --loss rms --gpu 1 \
+  > logs/alma_llama_rms.pipeline.log 2>&1 &
+```
+
+`--loss both`는 한 GPU에서 detach 학습·평가를 끝내고 RMS 학습·평가를 실행한다.
+모델을 `--model qwen`으로 바꿀 수도 있으며 Qwen의 SFT microbatch는 8이다.
+`--dry-run`은 데이터 manifest와 실행 설정만 읽고 GPU 검사·학습·파일 생성을 하지 않는다.
+다른 경로는 `--data-dir /path/to/data`, `--comet-python /path/to/venv/bin/python`,
+`--state-dir /path/to/state`로 지정한다. 환경변수로 학습·평가 설정을 바꾸지 않으며
+W&B는 기본 disabled, `--wandb-mode online` 또는 `offline`으로 선택한다.
+
+상태는 `logs/wmt23_gap_llama_detach_gpu0/state.json` 및
+`logs/wmt23_gap_llama_rms_gpu1/state.json`에 기록한다. 각 state 디렉터리의
+`*.retrieval.log`와 `*.evaluation.log`에 평가 로그를 남긴다. 결과는 run 아래
+`evaluations/wmt23_gap_variants_retrieval/test/in/`와
+`evaluations/wmt23_gap_variants_final/test/in/`에 저장된다.
+재실행하면 완료된 최종 모델과 평가 파일을 검증해 재사용한다. 평가가 중단된
+경우 같은 명령으로 남은 평가를 이어갈 수 있다. optimizer 상태가 없는 미완료
+학습은 자동 재학습하지 않고 해당 경로와 상태를 알린다.
+
 ## 다른 서버에서 세 실험 순차 실행 (2026-10-08)
 
 실행 순서는 다음과 같다. 모두 **BF16, 최종층 -1, seed 42, same_pair,
