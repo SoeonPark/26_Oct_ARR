@@ -53,7 +53,9 @@ In/Out Slot F1·EM 평가를 완료한 다음 실험으로 넘어간다.
 이 실행에는 **준비된 MT/ALMA 파일이나 COMET 환경이 필요하지 않다.**
 MASSIVE·OPUS·모델 가중치는 Hugging Face 캐시가 없으면 내려받는다.
 Llama 저장소 접근 권한이 있는 계정과 CUDA/BF16 지원 GPU가 필요하다.
-실행기를 호출한 Python을 학습·평가에도 사용한다.
+`scripts/massive_gap_variants.sh`는 Python 실행기를 호출해 학습·평가 순서를
+관리한다. 활성화된 환경의 Python을 학습·평가에도 사용하며,
+`PYTHON_BIN=/path/to/python`으로 직접 지정할 수도 있다.
 
 처음 받는 서버에서는 다음과 같이 준비한다. 이미 clone한 경우에는 저장소에서
 `git pull --ff-only origin main`을 실행하고 기존 환경을 활성화한다.
@@ -71,18 +73,18 @@ hf auth login
 상태 파일 생성을 하지 않는다. `--check-only`는 모델 가중치를 로드하지 않는다.
 
 ```bash
-python scripts/run_massive_gap_variants.py --model llama --gpu 0 --dry-run
-python scripts/run_massive_gap_variants.py --model llama --gpu 0 --check-only
-python scripts/run_massive_gap_variants.py --model qwen --gpu 1 --check-only
+bash scripts/massive_gap_variants.sh --model llama --gpu 0 --dry-run
+bash scripts/massive_gap_variants.sh --model llama --gpu 0 --check-only
+bash scripts/massive_gap_variants.sh --model qwen --gpu 1 --check-only
 ```
 
 비어 있는 GPU 두 장에서 각각 실행한다. GPU가 한 장이면 두 명령을 순차 실행한다.
 
 ```bash
 mkdir -p logs
-nohup python -u scripts/run_massive_gap_variants.py --model llama --gpu 0 \
+nohup bash scripts/massive_gap_variants.sh --model llama --gpu 0 \
   > logs/massive_gap_llama.log 2>&1 &
-nohup python -u scripts/run_massive_gap_variants.py --model qwen --gpu 1 \
+nohup bash scripts/massive_gap_variants.sh --model qwen --gpu 1 \
   > logs/massive_gap_qwen.log 2>&1 &
 ```
 
